@@ -11,6 +11,8 @@ import {
   isCodeFilePath,
   isMarkdownFilePath,
   isImageFilePath as isImageFilePathFromSync,
+  loadGbrainIgnoreGlobs,
+  matchesGbrainIgnorePath,
   pruneDir,
   type SyncStrategy,
 } from '../core/sync.ts';
@@ -530,6 +532,7 @@ function gitListSyncableFiles(
   dir: string,
   strategy: SyncStrategy,
   multimodalOn: boolean,
+  gbrainIgnoreGlobs: string[],
 ): string[] | null {
   let stdout: string;
   try {
@@ -545,6 +548,7 @@ function gitListSyncableFiles(
   for (const rel of stdout.split('\0')) {
     if (!rel) continue;
     if (!isCollectibleForWalker(rel, strategy, multimodalOn)) continue;
+    if (matchesGbrainIgnorePath(rel, gbrainIgnoreGlobs)) continue;
     const full = join(dir, rel);
     let st;
     try {
@@ -578,6 +582,7 @@ function gitListSyncableFiles(
 export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): string[] {
   const strategy: SyncStrategy = opts.strategy ?? 'markdown';
   const multimodalOn = process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
+  const gbrainIgnoreGlobs = loadGbrainIgnoreGlobs(dir);
 
   // v0.42.x (#1159 --respect-gitignore / #1483 .gbrainignore): when `dir` is a
   // git work tree, enumerate via `git ls-files` so the walk honors
@@ -588,7 +593,7 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
   // vendored data/fixtures). `--cached --others --exclude-standard` = tracked
   // PLUS untracked-not-ignored, so uncommitted source is still indexed. Non-git
   // dirs (or git unavailable) fall through to the FS walk below.
-  const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn);
+  const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn, gbrainIgnoreGlobs);
   if (gitFiles) return gitFiles;
 
   const maxDepth = resolveMaxWalkDepth();
@@ -637,6 +642,8 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
         walk(full, depth + 1);
       } else if (stat.isFile()) {
         if (!isCollectibleForWalker(entry, strategy, multimodalOn)) continue;
+        const rel = relative(dir, full).replace(/\\/g, '/');
+        if (matchesGbrainIgnorePath(rel, gbrainIgnoreGlobs)) continue;
         files.push(full);
       }
     }

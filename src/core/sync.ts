@@ -15,7 +15,7 @@ import { CJK_SLUG_CHARS } from './cjk.ts';
 // v0.37.7.0 #1169 submodule-detection helpers. Bottom-of-file already
 // aliases existsSync as `_existsSync` for other purposes; the top-of-file
 // import keeps the pruneDir helper's deps near its callsite.
-import { existsSync, statSync } from 'fs';
+import { existsSync, readFileSync, statSync } from 'fs';
 import { join as pathJoin } from 'path';
 
 export interface SyncManifest {
@@ -223,6 +223,46 @@ function matchesAnyGlob(path: string, patterns?: string[]): boolean {
   if (!patterns || patterns.length === 0) return false;
   const normalized = path.replace(/\\/g, '/');
   return patterns.some((pattern) => globToRegex(pattern).test(normalized));
+}
+
+export const GBRAIN_IGNORE_FILE = '.gbrainignore';
+
+/**
+ * Normalize one `.gbrainignore` line into the small glob dialect already used by
+ * sync include/exclude gates. This is intentionally exclude-only (no negation):
+ * GBrain's sync surface is a safety valve for keeping high-noise/generated
+ * content out of the brain, not a full gitignore replacement.
+ */
+export function normalizeGbrainIgnorePattern(raw: string): string | null {
+  let line = raw.trim();
+  if (!line || line.startsWith('#')) return null;
+  if (line.startsWith('!')) return null;
+
+  const anchored = line.startsWith('/');
+  line = line.replace(/\\/g, '/').replace(/^\/+/, '');
+  const directoryOnly = line.endsWith('/');
+  line = line.replace(/\/+$/, '');
+  if (!line) return null;
+  if (directoryOnly) line = `${line}/**`;
+  if (!anchored && !line.includes('/')) line = `**/${line}`;
+  return line;
+}
+
+export function loadGbrainIgnoreGlobs(repoPath: string): string[] {
+  const ignorePath = pathJoin(repoPath, GBRAIN_IGNORE_FILE);
+  try {
+    if (!existsSync(ignorePath)) return [];
+    return readFileSync(ignorePath, 'utf-8')
+      .split(/\r?\n/)
+      .map(normalizeGbrainIgnorePattern)
+      .filter((p): p is string => Boolean(p));
+  } catch {
+    return [];
+  }
+}
+
+export function matchesGbrainIgnorePath(path: string, patterns?: string[]): boolean {
+  return matchesAnyGlob(path, patterns);
 }
 
 /**

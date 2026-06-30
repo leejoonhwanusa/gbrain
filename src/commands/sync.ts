@@ -17,6 +17,7 @@ import {
   applySyncFailureGate,
   isSkippablePath,
   resolveAutoSkipThreshold,
+  loadGbrainIgnoreGlobs,
   DEFAULT_SOURCE_ID,
 } from '../core/sync.ts';
 import {
@@ -1835,8 +1836,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   }
   const manifest = delta.manifest;
 
-  // Filter to syncable files (strategy-aware)
-  const syncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
+  // Filter to syncable files (strategy-aware), honoring source-local .gbrainignore.
+  const gbrainIgnoreGlobs = loadGbrainIgnoreGlobs(repoPath);
+  const syncOpts = { strategy: opts.strategy ?? 'markdown', exclude: gbrainIgnoreGlobs };
+
   // #1970 (F-C): a rename whose DESTINATION is unsyncable drops out of BOTH
   // `renamed` (only `r.to` is kept below) AND `deleted` (git emits it as `R`,
   // not `D`), leaving the OLD page stale. Fold the source side into the delete
@@ -3104,7 +3107,8 @@ async function performFullSync(
   let reconciledDeletes = 0;
   if (opts.sourceId) {
     const sid = opts.sourceId;
-    const reconcileSyncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
+    const fullIgnoreGlobs = loadGbrainIgnoreGlobs(repoPath);
+    const reconcileSyncOpts = { strategy: opts.strategy ?? 'markdown', exclude: fullIgnoreGlobs };
     // collectSyncableFiles returns ABSOLUTE paths; source_path is stored
     // repo-relative (importFile uses `relative(dir, filePath)`), so relativize
     // to the same form before membership-testing — otherwise every page looks
@@ -3118,9 +3122,15 @@ async function performFullSync(
       [sid],
     );
     const staleSlugs = rows
-      .filter(r => r.source_path != null
-        && isSyncable(r.source_path, reconcileSyncOpts)
-        && !current.has(r.source_path))
+      .filter((r) => {
+        if (r.source_path == null) return false;
+        const reason = unsyncableReason(r.source_path, reconcileSyncOpts);
+        // A path excluded by .gbrainignore is intentionally outside the source
+        // boundary now, so full reconcile should purge its old file-backed page.
+        // Keep the historical strategy/metafile safety guard: those remain out
+        // of scope for this source's current sync mode.
+        return (reason === null || reason === 'exclude-glob-hit') && !current.has(r.source_path);
+      })
       .map(r => r.slug);
     if (staleSlugs.length > 0) {
       const deleteScopedOpts = { sourceId: sid };
