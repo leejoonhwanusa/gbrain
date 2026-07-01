@@ -294,6 +294,21 @@ export function validateRepoState(
     });
     remoteUrl = out.toString().trim();
   } catch {
+    // Local/unmanaged sources do not need an `origin` remote. Treat a repo
+    // with a valid worktree but no expected remote URL as healthy; otherwise
+    // sources_status falsely reports local memory mirrors as "corrupted".
+    if (expectedRemoteUrl === undefined) {
+      try {
+        const out = execFileSync('git', ['-C', repoPath, 'rev-parse', '--is-inside-work-tree'], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 10_000,
+          env: { ...process.env, ...GIT_ENV },
+        });
+        if (out.toString().trim() === 'true') return 'healthy';
+      } catch {
+        // fall through to corrupted
+      }
+    }
     return 'corrupted';
   }
 

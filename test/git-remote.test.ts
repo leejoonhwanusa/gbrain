@@ -1,6 +1,6 @@
 import { test, expect, describe, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync } from 'fs';
-import { join } from 'path';
+import { delimiter, join } from 'path';
 import { tmpdir } from 'os';
 import {
   GIT_SSRF_FLAGS,
@@ -32,10 +32,16 @@ function writeFakeGit(): void {
   writeFileSync(FAKE_GIT_LOG, '');
   const script = `#!/usr/bin/env bash
 # Fake git for git-remote.test.ts
-{ printf '['; for arg in "$@"; do printf '%s,' "$(printf '%s' "$arg" | jq -Rs .)"; done; printf 'null]\\n'; } >> "${FAKE_GIT_LOG}"
+{ for arg in "$@"; do printf '%s\037' "$arg"; done; printf '\n'; } >> "${FAKE_GIT_LOG}"
 mode=$(cat "${FAKE_GIT_MODE}" 2>/dev/null || echo ok)
 case "$mode" in
   fail) exit 1 ;;
+  no-origin)
+    case "$*" in
+      *"remote get-url origin"*) echo "error: No such remote 'origin'" >&2; exit 2 ;;
+      *"rev-parse --is-inside-work-tree"*) echo "true" ;;
+    esac
+    ;;
   url-drift) echo "https://github.com/different/url" ;;
   url-match) echo "https://github.com/expected/url" ;;
   *) ;;
@@ -45,6 +51,11 @@ exit 0
   const path = join(FAKE_GIT_DIR, 'git');
   writeFileSync(path, script);
   chmodSync(path, 0o755);
+  // Bun on Windows resolves execFileSync('git') through PATHEXT, so provide a
+  // .cmd shim that forwards to the POSIX fake-git script above.
+  writeFileSync(join(FAKE_GIT_DIR, 'git.cmd'), `@echo off
+bash "%~dp0git" %*
+`);
 }
 
 function readArgvLog(): string[][] {
@@ -52,17 +63,14 @@ function readArgvLog(): string[][] {
   return raw
     .split('\n')
     .filter(Boolean)
-    .map(line => {
-      const arr = JSON.parse(line) as (string | null)[];
-      return arr.filter((x): x is string => x !== null);
-    });
+    .map(line => line.split('\x1f').filter(Boolean));
 }
 
 function clearArgvLog(): void {
   writeFileSync(FAKE_GIT_LOG, '');
 }
 
-function setMode(mode: 'ok' | 'fail' | 'url-drift' | 'url-match'): void {
+function setMode(mode: 'ok' | 'fail' | 'no-origin' | 'url-drift' | 'url-match'): void {
   writeFileSync(FAKE_GIT_MODE, mode);
 }
 
@@ -73,7 +81,7 @@ beforeEach(() => {
   setMode('ok');
 });
 
-const fakePath = (): string => `${FAKE_GIT_DIR}:${process.env.PATH ?? ''}`;
+const fakePath = (): string => `${FAKE_GIT_DIR}${delimiter}${process.env.PATH ?? ''}`;
 
 // ---------------------------------------------------------------------------
 // GIT_SSRF_FLAGS — pinned shape (snapshot test). If a future flag is added,
@@ -411,6 +419,15 @@ describe('validateRepoState', () => {
     const p = join(fixtureDir, 'healthy-no-expect');
     mkdirSync(join(p, '.git'), { recursive: true });
     setMode('ok');
+    await withEnv({ PATH: fakePath() }, async () => {
+      expect(validateRepoState(p)).toBe('healthy');
+    });
+  });
+
+  test("returns 'healthy' for local repo without origin when no expected URL provided", async () => {
+    const p = join(fixtureDir, 'healthy-no-origin');
+    mkdirSync(join(p, '.git'), { recursive: true });
+    setMode('no-origin');
     await withEnv({ PATH: fakePath() }, async () => {
       expect(validateRepoState(p)).toBe('healthy');
     });
