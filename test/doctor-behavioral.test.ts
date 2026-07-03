@@ -21,10 +21,16 @@
  * that warrant their own parameterized test file.
  */
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { logRerankFailure } from '../src/core/rerank-audit.ts';
 import {
   buildChecks,
+  checkRerankerHealth,
   computeDoctorReport,
   type Check,
 } from '../src/commands/doctor.ts';
@@ -116,6 +122,71 @@ describe('computeDoctorReport — pure score aggregation', () => {
 });
 
 describe('buildChecks — orchestrator against PGLite', () => {
+  test('reranker_health ignores historical auth failures when reranker is disabled', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-reranker-disabled-'));
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        await engine.setConfig('search.reranker.enabled', 'false');
+        logRerankFailure({
+          model: 'zeroentropyai:zerank-2',
+          reason: 'auth',
+          query_hash: 'deadbeef',
+          doc_count: 30,
+          error_summary: 'invalid api key',
+        });
+
+        const check = await checkRerankerHealth(engine);
+        expect(check.status).toBe('ok');
+        expect(check.message).toContain('Reranker disabled');
+        expect(check.message).toContain('historical');
+      });
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+
+  test('reranker_health still warns on auth failures when reranker is enabled', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-reranker-enabled-'));
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        await engine.setConfig('search.reranker.enabled', 'true');
+        logRerankFailure({
+          model: 'zeroentropyai:zerank-2',
+          reason: 'auth',
+          query_hash: 'feedface',
+          doc_count: 30,
+          error_summary: 'invalid api key',
+        });
+
+        const check = await checkRerankerHealth(engine);
+        expect(check.status).toBe('warn');
+        expect(check.message).toContain('auth failure');
+      });
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+
+  test('graph_coverage ignores hidden test fixture entity pages', async () => {
+    for (const [slug, type] of [
+      ['test/e2e/fixtures/people/alice-example', 'person'],
+      ['test/e2e/fixtures/people/bob-example', 'person'],
+      ['test/e2e/fixtures/companies/acme-example', 'company'],
+      ['test/fixtures/claw-test-scenarios/fresh-install/brain/people/alice-example', 'person'],
+    ] as const) {
+      await engine.putPage(slug, {
+        title: slug.split('/').at(-1) ?? slug,
+        type,
+        compiled_truth: `Fixture entity ${slug}`,
+      });
+    }
+
+    const checks = await buildChecks(engine, []);
+    const graph = checks.find(c => c.name === 'graph_coverage');
+    expect(graph?.status).toBe('ok');
+    expect(graph?.message).toContain('test fixture entity pages');
+  });
+
   test('returns a non-empty Check[] against a fresh brain', async () => {
     const checks = await buildChecks(engine, []);
     expect(Array.isArray(checks)).toBe(true);

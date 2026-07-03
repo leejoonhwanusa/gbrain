@@ -120,7 +120,10 @@ export async function checkEntityLinkCoverage(
     engine,
     `SELECT COUNT(*) AS count FROM pages
        WHERE type IN ('person', 'company', 'organization', 'entity')
-         AND deleted_at IS NULL`,
+         AND deleted_at IS NULL
+         AND slug NOT LIKE 'tools/gbrain/test/%'
+         AND slug NOT LIKE 'test/%'
+         AND slug <> 'templates/new-person'`,
   );
 
   if (totalEntities === 0) {
@@ -144,6 +147,9 @@ export async function checkEntityLinkCoverage(
        SELECT p.id FROM pages p ${sampleClause}
        WHERE p.type IN ('person', 'company', 'organization', 'entity')
          AND p.deleted_at IS NULL
+         AND p.slug NOT LIKE 'tools/gbrain/test/%'
+         AND p.slug NOT LIKE 'test/%'
+         AND p.slug <> 'templates/new-person'
          AND EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
      ) sub`,
   );
@@ -215,7 +221,10 @@ export async function checkTimelineCoverage(
     engine,
     `SELECT COUNT(*) AS count FROM pages
        WHERE type IN ('person', 'company', 'organization', 'entity')
-         AND deleted_at IS NULL`,
+         AND deleted_at IS NULL
+         AND slug NOT LIKE 'tools/gbrain/test/%'
+         AND slug NOT LIKE 'test/%'
+         AND slug <> 'templates/new-person'`,
   );
 
   if (totalEntities === 0) {
@@ -237,6 +246,9 @@ export async function checkTimelineCoverage(
        SELECT p.id FROM pages p ${sampleClause}
        WHERE p.type IN ('person', 'company', 'organization', 'entity')
          AND p.deleted_at IS NULL
+         AND p.slug NOT LIKE 'tools/gbrain/test/%'
+         AND p.slug NOT LIKE 'test/%'
+         AND p.slug <> 'templates/new-person'
          AND EXISTS (SELECT 1 FROM timeline_entries t WHERE t.page_id = p.id)
      ) sub`,
   );
@@ -386,14 +398,16 @@ export async function checkPackUpgradeAvailable(
 ): Promise<OnboardCheckResult> {
   try {
     const { loadActivePack, findPackSuccessors } = await import('../schema-pack/load-active.ts');
+    const { loadConfig } = await import('../config.ts');
     // Read the engine's DB-side schema_pack so a post-unify flip is visible
-    // here even before the file-plane config catches up. Falls through to
-    // file-plane/env/default resolution when unset.
+    // here even before the file-plane config catches up. When DB is unset,
+    // still pass the file/env config so ~/.gbrain/config.json schema_pack is
+    // honored (local Doctor/onboard must agree with schema active/MCP).
     let dbConfig: string | undefined;
     try {
       dbConfig = (await engine.getConfig('schema_pack')) ?? undefined;
     } catch { /* engine.config may not exist on very old brains */ }
-    const active = await loadActivePack({ cfg: null, remote: false, dbConfig })
+    const active = await loadActivePack({ cfg: loadConfig(), remote: false, dbConfig })
       .catch(() => null);
     if (!active) {
       return {
@@ -463,11 +477,12 @@ export async function checkTypeProliferation(
   let declared = 15;  // fallback to gbrain-base-v2 default if pack unavailable
   try {
     const { loadActivePack } = await import('../schema-pack/load-active.ts');
+    const { loadConfig } = await import('../config.ts');
     let dbConfig: string | undefined;
     try {
       dbConfig = (await engine.getConfig('schema_pack')) ?? undefined;
     } catch { /* tolerate pre-config brains */ }
-    const active = await loadActivePack({ cfg: null, remote: false, dbConfig })
+    const active = await loadActivePack({ cfg: loadConfig(), remote: false, dbConfig })
       .catch(() => null);
     if (active) declared = active.manifest.page_types.length;
   } catch {

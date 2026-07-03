@@ -18,6 +18,7 @@ import { captureMetric } from '../../src/core/onboard/impact-capture.ts';
 import { buildOnboardReport, toOnboardRecommendation } from '../../src/core/onboard/render.ts';
 import { runAllOnboardChecks } from '../../src/core/onboard/checks.ts';
 import { makeRemediationStep } from '../../src/core/remediation-step.ts';
+import { resetPgliteState } from '../helpers/reset-pglite.ts';
 
 let engine: PGLiteEngine;
 
@@ -79,6 +80,32 @@ describe('onboard E2E — runAllOnboardChecks', () => {
     expect(byName.entity_link_coverage).toBe('ok');
     expect(byName.timeline_coverage).toBe('ok');
     expect(byName.takes_count).toBe('warn'); // 0 takes is a warn
+  });
+
+  test('test fixture entity pages do not lower link or timeline coverage', async () => {
+    await resetPgliteState(engine);
+    try {
+      for (const [slug, type] of [
+        ['test/e2e/fixtures/people/alice-example', 'person'],
+        ['test/e2e/fixtures/companies/acme-example', 'company'],
+        ['test/fixtures/claw-test-scenarios/fresh-install/brain/people/alice-example', 'person'],
+      ] as const) {
+        await engine.putPage(slug, {
+          title: slug.split('/').at(-1) ?? slug,
+          type,
+          compiled_truth: `Fixture entity ${slug}`,
+        });
+      }
+
+      const results = await runAllOnboardChecks(engine);
+      const byName = Object.fromEntries(results.map((r) => [r.check.name, r.check]));
+      expect(byName.entity_link_coverage.status).toBe('ok');
+      expect(byName.entity_link_coverage.message).toContain('No entity pages');
+      expect(byName.timeline_coverage.status).toBe('ok');
+      expect(byName.timeline_coverage.message).toContain('No entity pages');
+    } finally {
+      await resetPgliteState(engine);
+    }
   });
 
   test('empty brain remediations: takes_count gated, pack_upgrade_available may surface', async () => {

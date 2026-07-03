@@ -1405,11 +1405,13 @@ export async function checkVoiceGateHealth(engine: BrainEngine): Promise<Check> 
  *      failures in window → 'ok: reranker disabled'. Avoids interpreting
  *      "no events" as "broken" when reranker is simply not in use.
  *   2) Walk last 7 days of `~/.gbrain/audit/rerank-failures-*.jsonl`.
- *   3) Auth failures: ANY single one warns (config-time problem doctor's
- *      own probe should have caught — surface it).
- *   4) Transient (network/timeout/rate_limit): warn at >=5 in window.
+ *   3) Disabled reranker + historical failures: ok. The feature is not on,
+ *      so stale audit rows should not keep a disabled surface noisy.
+ *   4) Auth failures while enabled: ANY single one warns (config-time problem
+ *      doctor's own probe should have caught — surface it).
+ *   5) Transient (network/timeout/rate_limit): warn at >=5 in window.
  *      Below that they're noise; reranker fails open anyway.
- *   5) Payload-too-large failures: warn at >=1 (indicates a workload
+ *   6) Payload-too-large failures: warn at >=1 (indicates a workload
  *      mismatch that the operator should know about).
  *
  * Engine-agnostic (file-based + one config-key read).
@@ -1428,6 +1430,14 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
         message: rerankerEnabled
           ? 'No rerank failures in last 7 days'
           : 'Reranker disabled — no failures expected',
+      };
+    }
+
+    if (!rerankerEnabled) {
+      return {
+        name: 'reranker_health',
+        status: 'ok',
+        message: `Reranker disabled — ignoring ${failures.length} historical reranker failure(s) in last 7 days`,
       };
     }
 
@@ -5764,6 +5774,7 @@ export async function buildChecks(
         SELECT id FROM pages
         WHERE type IN ('entity','person','company','organization')
           AND slug NOT LIKE 'tools/gbrain/test/%'
+          AND slug NOT LIKE 'test/%'
           AND slug <> 'templates/new-person'
       )
       SELECT

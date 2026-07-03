@@ -18,6 +18,7 @@ import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { runUnifyTypes } from '../../src/core/schema-pack/unify-types-handler.ts';
 import { runAllOnboardChecks } from '../../src/core/onboard/checks.ts';
 import { _resetPackCacheForTests } from '../../src/core/schema-pack/registry.ts';
+import { emptyHome, withEnv } from '../helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 
@@ -105,7 +106,8 @@ async function seedAll9Clusters() {
 
 describe('v0.42 type-unification E2E (IRON RULE)', () => {
   it('runs the full pipeline against a synthetic 9-cluster brain', async () => {
-    const seedCount = await seedAll9Clusters();
+    await withEnv({ GBRAIN_HOME: emptyHome(), GBRAIN_SCHEMA_PACK: undefined }, async () => {
+      const seedCount = await seedAll9Clusters();
     expect(seedCount).toBeGreaterThan(25);
 
     // Pre-state: many distinct types
@@ -186,9 +188,10 @@ describe('v0.42 type-unification E2E (IRON RULE)', () => {
       target_pack: 'gbrain-base-v2',
       apply: true,
     });
-    expect(idempResult.per_phase.retype_explicit.applied).toBe(0);
-    expect(idempResult.per_phase.page_to_alias.aliased).toBe(0);
-    expect(idempResult.per_phase.page_to_link.converted).toBe(0);
+      expect(idempResult.per_phase.retype_explicit.applied).toBe(0);
+      expect(idempResult.per_phase.page_to_alias.aliased).toBe(0);
+      expect(idempResult.per_phase.page_to_link.converted).toBe(0);
+    });
   });
 
   it('canonical pages preserve their type identity', async () => {

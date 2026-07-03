@@ -24,10 +24,16 @@ import {
   _resetUnknownCheckWarningsForTest,
 } from '../src/core/doctor-categories.ts';
 
-const DOCTOR_TS_PATH = join(import.meta.dir, '..', 'src', 'commands', 'doctor.ts');
+const CHECK_SOURCE_PATHS = [
+  join(import.meta.dir, '..', 'src', 'commands', 'doctor.ts'),
+  // `doctor.ts` also folds onboard checks into the rendered DoctorReport.
+  // Keep those names in the drift guard so runtime categorization never
+  // emits unknown-check stderr warnings for the onboard surface.
+  join(import.meta.dir, '..', 'src', 'core', 'onboard', 'checks.ts'),
+];
 
 function enumerateCheckNames(): Set<string> {
-  const source = readFileSync(DOCTOR_TS_PATH, 'utf-8');
+  const source = CHECK_SOURCE_PATHS.map((p) => readFileSync(p, 'utf-8')).join('\n');
   const names = new Set<string>();
   // 1) Inline object-literal form: `{ name: 'foo', ... }`.
   for (const m of source.matchAll(/name:\s*['"]([a-z][a-z0-9_]+)['"]/g)) {

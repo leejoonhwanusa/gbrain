@@ -50,6 +50,12 @@ describe('parseMarkdown validation surface', () => {
       const e = parsed.errors!.find(e => e.code === 'MISSING_CLOSE');
       expect(e).toBeDefined();
     });
+
+    test('YAML comments that look like markdown headings are not body headings', () => {
+      const md = `${fence}\ntype: concept\ntitle: hi\n# a YAML comment inside frontmatter\n${fence}\n\n# Body heading`;
+      const parsed = parseMarkdown(md, undefined, { validate: true });
+      expect(parsed.errors!.map(e => e.code)).not.toContain('MISSING_CLOSE');
+    });
   });
 
   describe('YAML_PARSE', () => {

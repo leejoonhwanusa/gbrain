@@ -200,10 +200,27 @@ of chasing the score directly:
    `gbrain extract --stale` and then address lower-priority content quality rows
    such as frontmatter warnings, graph/timeline coverage, takes, and pack upgrade
    previews.
+6. **Warning-only cleanup.** Treat WARN rows as separate lanes, not one global
+   `--fix` pass:
+   - `reranker_health`: first check whether `search.reranker.enabled` is false.
+     Disabled reranker + historical audit failures should be reported as OK;
+     only enabled rerankers with auth failures need key remediation.
+   - `pack_upgrade_available`: compare `gbrain schema stats --json`,
+     `~/.gbrain/config.json`, and any DB `schema_pack` value before running
+     type-unification. If the active file-plane pack is already `gbrain-base-v2`,
+     the onboard check must pass the loaded config into active-pack resolution.
+   - `frontmatter_integrity`: run `gbrain frontmatter audit --json` and fix only
+     source-scoped, human-reviewed candidates. Do not blanket-fix fixtures,
+     external corpora, or quarantine mirrors.
+   - `flagged_pages` / `oversized_pages`: `gbrain quarantine list
+     --include-flagged --json` distinguishes hidden quarantine from searchable
+     flagged rows. Searchable flags are warnings, not data loss.
 
 Repeat `gbrain doctor --json` after each tier. A source can be operationally fresh
 while lower-priority content-quality warnings remain; report those separately from
-P1 blockers.
+P1 blockers. For code-repo sources, after committing a remediation, re-pin the
+source with an explicit source-scoped sync and verify `last_commit == git rev-parse
+HEAD` plus `chunks_unembedded == 0` before claiming the brain index is current.
 
 ---
 

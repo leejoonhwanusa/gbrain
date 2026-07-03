@@ -213,19 +213,26 @@ function collectValidationErrors(
     return;
   }
 
-  // 3. MISSING_CLOSE — find the next `---` after the opener. If a markdown
-  //    heading appears before it, that's a strong signal the closing
-  //    delimiter is missing (the heading was meant to be in the body).
+  // 3. MISSING_CLOSE — find the next `---` after the opener. If no
+  //    delimiter exists and a markdown heading appears later, surface that
+  //    in the message. Do not treat `# ...` lines before an existing close
+  //    as body headings: in YAML frontmatter they are legal comments.
   let closeLine = -1;
-  let headingBeforeClose = -1;
   for (let i = firstNonEmpty + 1; i < lines.length; i++) {
     const t = lines[i].trim();
     if (t === '---') {
       closeLine = i;
       break;
     }
-    if (/^#{1,6}\s/.test(t) && headingBeforeClose === -1) {
-      headingBeforeClose = i;
+  }
+  let headingBeforeClose = -1;
+  if (closeLine === -1) {
+    for (let i = firstNonEmpty + 1; i < lines.length; i++) {
+      const t = lines[i].trim();
+      if (/^#{1,6}\s/.test(t)) {
+        headingBeforeClose = i;
+        break;
+      }
     }
   }
   if (closeLine === -1) {
