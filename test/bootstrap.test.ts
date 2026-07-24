@@ -161,6 +161,38 @@ describe('PGLiteEngine#applyForwardReferenceBootstrap', () => {
     }
   }, 30000);
 
+  test('pre-v121 timeline shape reaches LATEST before schema indexes reference event_page_id', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+
+      // Reproduce the 0.42.56 upgrade wedge: an otherwise-modern brain at
+      // schema v120 has timeline_entries but not migration v121's projection
+      // pointer. The latest schema blob creates indexes on event_page_id before
+      // runMigrations() can add the column unless bootstrap repairs the shape.
+      await db.exec(`
+        DROP INDEX IF EXISTS idx_timeline_event_dedup;
+        DROP INDEX IF EXISTS idx_timeline_event_page;
+        ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
+        ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id;
+      `);
+      await engine.setConfig('version', '120');
+
+      await engine.initSchema();
+
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+      const { rows: cols } = await db.query(`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'timeline_entries' AND column_name = 'event_page_id'
+      `);
+      expect(cols).toHaveLength(1);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
   test('pre-v0.13 links shape: bootstrap adds link_source + origin_page_id', async () => {
     // Issues #266 / #357 — pre-v0.13 brains had `links` without
     // `link_source` / `origin_page_id`. Schema blob's

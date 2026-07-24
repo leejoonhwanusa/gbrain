@@ -91,6 +91,30 @@ describe.skipIf(skip)('PostgresEngine forward-reference bootstrap (E2E)', () => 
     expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
   });
 
+  test('PostgresEngine.initSchema upgrades a pre-v121 timeline shape before schema index replay', async () => {
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+
+    await conn.unsafe(`
+      DROP INDEX IF EXISTS idx_timeline_event_dedup;
+      DROP INDEX IF EXISTS idx_timeline_event_page;
+      ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
+      ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id;
+    `);
+    await engine.setConfig('version', '120');
+
+    await engine.initSchema();
+
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+    const cols = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'timeline_entries'
+        AND column_name = 'event_page_id'
+    `;
+    expect(cols).toHaveLength(1);
+  });
+
   // Migration v120 — schema-lint hardening (#1647 / #171). Postgres-only
   // assertions (security_invoker has no surface on embedded PGLite).
   test('v120: page_links view runs with security_invoker=on (#1647b)', async () => {

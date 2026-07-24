@@ -168,6 +168,10 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // SCHEMA_SQL replay creates the index. Powers `gbrain extract --stale` + the
   // `links_extraction_lag` doctor check.
   { kind: 'column', table: 'pages', column: 'links_extracted_at' },
+  // v0.42.56.0 (v121) — the schema blob creates partial indexes on
+  // timeline_entries.event_page_id before the migration runner executes.
+  // Existing v120 tables keep their old shape under CREATE TABLE IF NOT EXISTS.
+  { kind: 'column', table: 'timeline_entries', column: 'event_page_id' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
