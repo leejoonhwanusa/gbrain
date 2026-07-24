@@ -2,6 +2,12 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## Unreleased
+
+### Fixed
+- **Compiled Windows binaries can detach the Minions supervisor correctly.** The detached re-exec path now drops Bun's virtual `B:/~BUN/root/...` entrypoint instead of feeding it back to the compiled executable as an unknown command; source execution still preserves `src/cli.ts`.
+- **Deployments can impose a conservative embedding request cap without editing a provider recipe.** `GBRAIN_AI_EMBED_MAX_BATCH_TOKENS` is read from the gateway's configure-time environment snapshot and overrides a recipe cap only when it is a positive safe integer.
+
 ## [0.42.56.0] - 2026-07-02
 
 **Life Chronicle: gbrain gains a temporal spine. Meetings and transcripts project into a queryable timeline, entities carry a bi-temporal ontology (sourced, confidence-weighted properties that supersede over time), and a low-friction diary captures interiority — so an agent can reconstruct "what happened the week of X", answer "when did I last interact with Y", and see how an entity's role or stance changed, instead of re-deriving chronology from scratch every session.** Built entirely on existing primitives (pages, the `facts` table, `timeline_entries`) — no new datastore. Auto-emission is off by default; opt in per below.
@@ -44,8 +50,6 @@ All notable changes to GBrain will be documented in this file.
 **`gbrain sync` works again on managed Postgres brains: the durable-checkpoint pin write was encoding its value the wrong way, so every multi-source sync aborted at the very first checkpoint. Fixed, plus a repo-wide sweep of the same JSONB footgun and a new CI guard so it can't come back.** A recent release added a structural check on the sync checkpoint table; the pin write that runs before every drain bound its value as a string rather than a real array, so the check rejected it and the run bailed before importing anything. The bug was invisible on the embedded engine (its driver parses the value either way) and only bit managed Postgres.
 
 ### Fixed
-- **Compiled Windows binaries can detach the Minions supervisor correctly.** The detached re-exec path now drops Bun's virtual `B:/~BUN/root/...` entrypoint instead of feeding it back to the compiled executable as an unknown command; source execution still preserves `src/cli.ts`.
-- **Deployments can impose a conservative embedding request cap without editing a provider recipe.** `GBRAIN_AI_EMBED_MAX_BATCH_TOKENS` is read from the gateway's configure-time environment snapshot and overrides a recipe cap only when it is a positive safe integer.
 - **Multi-source sync no longer aborts at the first checkpoint.** The sync-target pin write now binds its value so Postgres stores a genuine JSONB array instead of a double-encoded string scalar. A dedicated Postgres CI job exercises this on a real database, because the embedded test engine masks the failure — which is exactly why it shipped.
 - **The same JSONB double-encode footgun is swept across the codebase.** Every raw write that serialized a value into a JSONB column the bug-prone way is corrected to the safe form (search cache, source config, calibration profiles, subagent tool records, eval receipts, code-intel cache, symbol resolver, and others). Readers were already defensive, so existing rows self-heal as each is rewritten.
 - **`gbrain eval suspected-contradictions` no longer crashes on an exact-alias query.** An alias-matched result was missing its page id, which aborted the whole probe on Postgres; the id is now carried through, with a finite-id filter as a defensive backstop.
