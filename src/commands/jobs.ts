@@ -22,6 +22,31 @@ function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
 }
 
+/**
+ * Build the detached supervisor re-exec command for both source execution and
+ * Bun-compiled binaries. Compiled Bun processes expose a virtual entrypoint
+ * such as `B:/~BUN/root/gbrain` in argv[1]; passing that path back to the
+ * executable makes the CLI parse it as an unknown command. Source execution
+ * still needs argv[1] (`src/cli.ts`) after the Bun executable.
+ */
+export function buildSupervisorDetachInvocation(
+  processExecPath: string,
+  argv: string[],
+): { command: string; args: string[] } {
+  const entrypoint = argv[1];
+  const normalizedEntrypoint = entrypoint?.replace(/\\/g, '/') ?? '';
+  const isBunVirtualEntrypoint =
+    normalizedEntrypoint.includes('/~BUN/root/') ||
+    normalizedEntrypoint.includes('/$bunfs/root/');
+  const childArgs = argv.slice(2).filter(a => a !== '--detach');
+  return {
+    command: processExecPath,
+    args: isBunVirtualEntrypoint || !entrypoint
+      ? childArgs
+      : [entrypoint, ...childArgs],
+  };
+}
+
 /** Parse `--max-waiting N` from CLI args. Returns undefined if absent.
  *  Throws on malformed input (caller should surface the error and exit).
  *  Clamps to [1, 100] to match the queue-layer clamp in MinionQueue.add.
@@ -1224,8 +1249,8 @@ HANDLER TYPES (built in)
       // if they wanted to follow logs) but detaching stdin/stdout.
       if (detach) {
         const { spawn } = await import('child_process');
-        const childArgs = process.argv.slice(2).filter(a => a !== '--detach');
-        const child = spawn(process.execPath, [process.argv[1], ...childArgs], {
+        const invocation = buildSupervisorDetachInvocation(process.execPath, process.argv);
+        const child = spawn(invocation.command, invocation.args, {
           detached: true,
           stdio: ['ignore', 'ignore', 'inherit'],
           env: process.env,

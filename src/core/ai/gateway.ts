@@ -1387,11 +1387,19 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   const expected = effectiveDims;
 
   const embedding = recipe.touchpoints?.embedding;
-  const maxBatchTokens = embedding?.max_batch_tokens;
+  const configuredMaxBatchTokens = cfg.env.GBRAIN_AI_EMBED_MAX_BATCH_TOKENS;
+  const parsedMaxBatchTokens = configuredMaxBatchTokens === undefined
+    ? undefined
+    : Number(configuredMaxBatchTokens);
+  const maxBatchTokens = Number.isSafeInteger(parsedMaxBatchTokens) && parsedMaxBatchTokens! > 0
+    ? parsedMaxBatchTokens
+    : embedding?.max_batch_tokens;
   const charsPerToken = embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN;
 
-  // Pre-split is gated on max_batch_tokens. Recipes without it (e.g. OpenAI)
-  // ride the fast path: one embedMany call, no recursion safety net.
+  // Pre-split is gated on the deployment override or recipe max_batch_tokens.
+  // Recipes without either (e.g. OpenAI) ride the fast path: one embedMany
+  // call, no recursion safety net. The override is read from cfg.env so the
+  // gateway keeps its configure-time environment snapshot contract.
   const batches = maxBatchTokens
     ? splitByTokenBudget(truncated, Math.floor(maxBatchTokens * effectiveSafetyFactor(recipe)), charsPerToken)
     : [truncated];

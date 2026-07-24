@@ -274,6 +274,48 @@ describe('embed() OpenAI fast path (no max_batch_tokens)', () => {
     expect(result).toHaveLength(100);
   });
 
+  test('configured env batch cap partitions a recipe that has no static cap', async () => {
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      env: {
+        OPENAI_API_KEY: 'sk-fake',
+        GBRAIN_AI_EMBED_MAX_BATCH_TOKENS: '4',
+      },
+    });
+
+    const stub = mock(async ({ values }: { values: string[] }) => fakeEmbeddings(values, 1536));
+    __setEmbedTransportForTests(stub as any);
+
+    const texts = ['aaaaaaaa', 'bbbbbbbb', 'cccccccc', 'dddddddd'];
+    const result = await embed(texts);
+
+    expect(stub.mock.calls.length).toBeGreaterThan(1);
+    const submitted = stub.mock.calls.flatMap(
+      ([arg]) => (arg as { values: string[] }).values,
+    );
+    expect(submitted).toEqual(texts);
+    expect(result).toHaveLength(texts.length);
+  });
+
+  test('invalid configured env batch cap preserves the recipe fast path', async () => {
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      env: {
+        OPENAI_API_KEY: 'sk-fake',
+        GBRAIN_AI_EMBED_MAX_BATCH_TOKENS: 'invalid',
+      },
+    });
+
+    const stub = mock(async ({ values }: { values: string[] }) => fakeEmbeddings(values, 1536));
+    __setEmbedTransportForTests(stub as any);
+
+    await embed(['aaaaaaaa', 'bbbbbbbb']);
+
+    expect(stub).toHaveBeenCalledTimes(1);
+  });
+
   test('OpenAI fast path is unaffected by Voyage shrink state', async () => {
     // Configure Voyage first and trigger a shrink…
     configureVoyage();
