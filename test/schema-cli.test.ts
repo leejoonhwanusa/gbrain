@@ -36,7 +36,17 @@ function gbrain(
   // bun's spawnSync does NOT inherit env mutations done via process.env = ...,
   // so pass env explicitly. CLAUDE.md flags this pattern as load-bearing for
   // any subprocess test that needs GBRAIN_HOME isolation.
-  const env = { ...process.env, GBRAIN_HOME: DEFAULT_GBRAIN_HOME, ...extraEnv };
+  const env: NodeJS.ProcessEnv = { ...process.env, GBRAIN_HOME: DEFAULT_GBRAIN_HOME };
+  // File-config tests must not inherit the operator's live DB-plane
+  // overrides; those would replace the fixture's engine and home.
+  delete env.GBRAIN_DATABASE_URL;
+  delete env.DATABASE_URL;
+  delete env.PGDATABASE;
+  delete env.PGUSER;
+  delete env.PGPASSWORD;
+  delete env.PGHOST;
+  delete env.PGPORT;
+  Object.assign(env, extraEnv);
   const result = spawnSync('bun', ['run', 'src/cli.ts', ...args], {
     cwd: REPO_ROOT,
     encoding: 'utf-8',
@@ -58,11 +68,21 @@ describe('gbrain schema CLI (Phase C)', () => {
     expect(r.stdout + r.stderr).toMatch(/schema|active|list|show|validate|use/i);
   });
 
-  test('schema list shows gbrain-base bundled', () => {
+  test('schema list shows every loadable bundled pack', () => {
     const r = gbrain(['schema', 'list']);
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('Bundled packs:');
-    expect(r.stdout).toContain('gbrain-base');
+    for (const name of [
+      'gbrain-base',
+      'gbrain-recommended',
+      'gbrain-creator',
+      'gbrain-investor',
+      'gbrain-engineer',
+      'gbrain-everything',
+      'gbrain-base-v2',
+    ]) {
+      expect(r.stdout).toContain(`  ${name}\n`);
+    }
   });
 
   test('schema show gbrain-base prints manifest details', () => {
