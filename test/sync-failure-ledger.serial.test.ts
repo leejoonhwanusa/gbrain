@@ -419,3 +419,16 @@ describe('resolveAutoSkipThreshold', () => {
     expect(resolveAutoSkipThreshold()).toBe(3);
   });
 });
+
+describe('transient timeout classification', () => {
+  test('distinguishes local Git verification from embedding timeouts', async () => {
+    const { classifyErrorCode } = await L();
+
+    expect(
+      classifyErrorCode('git HEAD verification failed: spawnSync git ETIMEDOUT'),
+    ).toBe('GIT_TIMEOUT');
+    expect(
+      classifyErrorCode('[embed(docs/architecture/KEY_FILES)] Qwen embedding timed out after 120000ms'),
+    ).toBe('EMBEDDING_TIMEOUT');
+  });
+});

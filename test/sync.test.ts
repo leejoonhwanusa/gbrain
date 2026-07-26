@@ -1,6 +1,11 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { buildSyncManifest, isSyncable, pathToSlug, pruneDir, isCodeFilePath } from '../src/core/sync.ts';
-import { buildAutoEmbedArgs, buildGitInvocation } from '../src/commands/sync.ts';
+import {
+  buildAutoEmbedArgs,
+  buildGitInvocation,
+  formatHeadVerificationBlock,
+  LOCAL_GIT_TIMEOUT_MS,
+} from '../src/commands/sync.ts';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
@@ -653,6 +658,33 @@ describe('git() helper invocation order (CJK wave v0.32.7)', () => {
       '-c', 'core.quotepath=false',
       '-C', '/repo',
     ]);
+  });
+});
+
+describe('sync HEAD verification under Windows load', () => {
+  test('allows two minutes for local Git commands', () => {
+    expect(LOCAL_GIT_TIMEOUT_MS).toBe(120_000);
+  });
+
+  test('does not label a transient HEAD timeout as a history rewrite', () => {
+    const message = formatHeadVerificationBlock(
+      [{ path: '<head>', error: 'git HEAD verification failed: spawnSync git ETIMEDOUT' }],
+      '  GIT_TIMEOUT: 1',
+    );
+
+    expect(message).toContain('repository HEAD verification was unavailable');
+    expect(message).toContain('no history rewrite is assumed');
+    expect(message).not.toContain('repository history changed during sync');
+  });
+
+  test('keeps the hard warning for an actual ancestry change', () => {
+    const message = formatHeadVerificationBlock(
+      [{ path: '<head>', error: 'git history rewritten during sync: abc123 is no longer an ancestor of def456' }],
+      '  GIT_HISTORY_REWRITE: 1',
+    );
+
+    expect(message).toContain('repository history changed during sync');
+    expect(message).toContain('is no longer an ancestor of HEAD');
   });
 });
 

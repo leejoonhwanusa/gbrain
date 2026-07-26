@@ -148,6 +148,11 @@ export function classifyErrorCode(errorMsg: string): string {
   if (/file too large|content too large|FILE_TOO_LARGE/i.test(errorMsg)) return 'FILE_TOO_LARGE';
   if (/skipping symlink|symlink|SYMLINK_NOT_ALLOWED/i.test(errorMsg)) return 'SYMLINK_NOT_ALLOWED';
 
+  // Transient infrastructure timeouts need actionable labels. Keep the Git
+  // pattern narrow so provider timeouts are not mislabeled as repository I/O.
+  if (/git HEAD verification failed:.*(?:ETIMEDOUT|timed out)/i.test(errorMsg)) return 'GIT_TIMEOUT';
+  if (/\[embed\([^\]]+\)\].*(?:ETIMEDOUT|timed out)/i.test(errorMsg)) return 'EMBEDDING_TIMEOUT';
+
   // takes-v2 fence + holder grammar failures.
   if (/TAKES_TABLE_MALFORMED|TAKES_ROW_NUM_COLLISION|TAKES_FENCE_UNBALANCED/i.test(errorMsg)) {
     return 'TAKES_TABLE_MALFORMED';

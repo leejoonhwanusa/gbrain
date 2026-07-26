@@ -884,6 +884,34 @@ export function buildGitInvocation(repoPath: string, args: string[], configs: st
   return [...cfg, '-C', repoPath, ...args];
 }
 
+// Local Git can be delayed by antivirus scans or CPU-heavy embedding work on
+// Windows. A transient 30-second timeout at the final HEAD check must not be
+// misreported as a force-push/history rewrite.
+export const LOCAL_GIT_TIMEOUT_MS = 120_000;
+
+export function formatHeadVerificationBlock(
+  failedFiles: Array<{ path: string; error: string }>,
+  codeBreakdown: string,
+): string {
+  const headFailure = failedFiles.find((failure) => failure.path === '<head>');
+  const detail = headFailure?.error ?? 'repository HEAD verification failed';
+  if (detail.startsWith('git history rewritten during sync:')) {
+    return (
+      `\nSync blocked: repository history changed during sync (force-push / reset).\n` +
+      `${codeBreakdown}\n\n` +
+      `The pinned target is no longer an ancestor of HEAD; advancing would record ` +
+      `a commit that doesn't match the indexed tree. Re-run sync to re-pin against ` +
+      `current HEAD.`
+    );
+  }
+  return (
+    `\nSync blocked: repository HEAD verification was unavailable.\n` +
+    `${codeBreakdown}\n\n${detail}\n\n` +
+    `The sync bookmark was not advanced. Re-run sync after the transient Git ` +
+    `failure clears; no history rewrite is assumed.`
+  );
+}
+
 export function buildAutoEmbedArgs(slugs: string[], sourceId?: string): string[] {
   return sourceId ? ['--source', sourceId, '--slugs', ...slugs] : ['--slugs', ...slugs];
 }
@@ -901,7 +929,7 @@ export function buildAutoEmbedArgs(slugs: string[], sourceId?: string): string[]
 function git(repoPath: string, args: string[], configs: string[] = []): string {
   return execFileSync('git', buildGitInvocation(repoPath, args, configs), {
     encoding: 'utf-8',
-    timeout: 30000,
+    timeout: LOCAL_GIT_TIMEOUT_MS,
     maxBuffer: 100 * 1024 * 1024,
   }).trim();
 }
@@ -2756,13 +2784,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   if (!gate.advanced) {
     const codeBreakdown = formatCodeBreakdown(failedFiles);
     if (gate.sentinelBlocked) {
-      serr(
-        `\nSync blocked: repository history changed during sync (force-push / reset).\n` +
-        `${codeBreakdown}\n\n` +
-        `The pinned target is no longer an ancestor of HEAD; advancing would record ` +
-        `a commit that doesn't match the indexed tree. Re-run sync to re-pin against ` +
-        `current HEAD.`,
-      );
+      serr(formatHeadVerificationBlock(failedFiles, codeBreakdown));
     } else {
       const fileFailCount = failedFiles.filter(f => isSkippablePath(f.path)).length;
       serr(
