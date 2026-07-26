@@ -94,6 +94,61 @@ describe('E2E: worker abort recovery (2026-04-24 regression)', () => {
     expect(fastResult!.result).toEqual({ done: true });
   });
 
+  test('progressing embed-backfill resumes without burning an attempt after timeout', async () => {
+    const job = await queue.add('embed-backfill', {}, {
+      timeout_ms: 100,
+      max_attempts: 1,
+      backoff_delay: 60_000,
+    });
+
+    const worker = new MinionWorker(engine, {
+      pollInterval: 25,
+      concurrency: 1,
+    });
+
+    worker.register('embed-backfill', async (ctx) => {
+      while (!ctx.signal.aborted) {
+        await new Promise(r => setTimeout(r, 10));
+      }
+      return { status: 'aborted', chunksProcessed: 1 };
+    });
+
+    const workerPromise = worker.start();
+    await new Promise(r => setTimeout(r, 500));
+    worker.stop();
+    await workerPromise;
+
+    const result = await queue.getJob(job.id);
+    expect(result!.status).toBe('delayed');
+    expect(result!.attempts_made).toBe(0);
+    expect(result!.error_text).toContain('partial progress preserved');
+    expect(result!.result).toBeNull();
+  });
+
+  test('zero-progress embed-backfill still honors the retry limit', async () => {
+    const job = await queue.add('embed-backfill', {}, {
+      timeout_ms: 100,
+      max_attempts: 1,
+    });
+    const worker = new MinionWorker(engine, { pollInterval: 25, concurrency: 1 });
+
+    worker.register('embed-backfill', async (ctx) => {
+      while (!ctx.signal.aborted) {
+        await new Promise(r => setTimeout(r, 10));
+      }
+      return { status: 'aborted', chunksProcessed: 0 };
+    });
+
+    const workerPromise = worker.start();
+    await new Promise(r => setTimeout(r, 500));
+    worker.stop();
+    await workerPromise;
+
+    const result = await queue.getJob(job.id);
+    expect(result!.status).toBe('dead');
+    expect(result!.attempts_made).toBe(1);
+  });
+
   test('concurrency=2 worker still processes jobs while one slot is timing out', async () => {
     const slowJob = await queue.add('slow-c2', {}, {
       timeout_ms: 200,

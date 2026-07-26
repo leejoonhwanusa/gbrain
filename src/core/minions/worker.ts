@@ -975,6 +975,46 @@ export class MinionWorker extends EventEmitter {
     try {
       const result = await handler(context);
 
+      const resultRecord = result != null && typeof result === 'object'
+        ? result as Record<string, unknown>
+        : null;
+      const progressingEmbedBackfill =
+        job.name === 'embed-backfill' &&
+        resultRecord?.status === 'aborted' &&
+        typeof resultRecord.chunksProcessed === 'number' &&
+        resultRecord.chunksProcessed > 0;
+
+      if (abort.signal.aborted && progressingEmbedBackfill) {
+        clearInterval(lockTimer);
+        const reason = abort.signal.reason instanceof Error
+          ? abort.signal.reason.message
+          : String(abort.signal.reason || 'aborted');
+        const released = await this.queue.releaseJobWithoutAttempt(
+          job.id,
+          lockToken,
+          `aborted: ${reason}; partial progress preserved`,
+          job.backoff_delay,
+        );
+        if (!released) {
+          console.warn(`Job ${job.id} progressing backfill release dropped (lock token mismatch)`);
+          return;
+        }
+        console.log(
+          `Job ${job.id} (${job.name}) made partial progress before ${reason}; ` +
+          `re-queuing without burning an attempt`,
+        );
+        return;
+      }
+
+      // A cooperative handler may observe the AbortSignal, preserve partial
+      // progress, and return normally. The worker timeout/cancel still owns
+      // the terminal state: accepting that return would turn an interrupted
+      // job into a false `completed` row (notably embed-backfill), preventing
+      // retry/recovery while work remains.
+      if (abort.signal.aborted) {
+        throw abort.signal.reason || new Error('aborted');
+      }
+
       clearInterval(lockTimer);
 
       // Complete the job (token-fenced)

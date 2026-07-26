@@ -1033,8 +1033,7 @@ export class MinionQueue {
   }
 
   /**
-   * v0.41 Bug 2 — release a job back to `delayed` after a
-   * `RateLeaseUnavailableError` bounce, WITHOUT incrementing `attempts_made`.
+   * Release a job back to `delayed` WITHOUT incrementing `attempts_made`.
    *
    * The field-report bug: pre-v0.41, lease-full bounces routed through
    * `failJob` which bumps `attempts_made`. After 3 bounces the job hit
@@ -1042,10 +1041,8 @@ export class MinionQueue {
    * `rate lease "anthropic:messages" full (8/8)`. Operators saw a dead
    * job and assumed a real failure.
    *
-   * This method is the workhorse fix: status → `delayed`, jittered backoff
-   * via `delay_until`, `attempts_made` UNCHANGED. The handler comment at
-   * `src/core/minions/handlers/subagent.ts:425` ("treat as renewable
-   * error so the worker re-claims") is now actually true.
+   * This is shared by renewable resource-pressure bounces and bounded jobs
+   * that made durable partial progress before a cooperative timeout.
    *
    * Audit row write to `minion_lease_pressure_log` is the caller's
    * responsibility (the worker has the model/queue context); this method
@@ -1056,7 +1053,7 @@ export class MinionQueue {
    * Returns the updated `MinionJob` row on success so the caller can stamp
    * the audit row with provenance from the SAME row that just flipped.
    */
-  async releaseLeaseFullJob(
+  async releaseJobWithoutAttempt(
     id: number,
     lockToken: string,
     errorText: string,
@@ -1075,6 +1072,16 @@ export class MinionQueue {
     );
     if (rows.length === 0) return null;
     return rowToMinionJob(rows[0]);
+  }
+
+  /** Compatibility surface for the lease-pressure path. */
+  async releaseLeaseFullJob(
+    id: number,
+    lockToken: string,
+    errorText: string,
+    backoffMs: number,
+  ): Promise<MinionJob | null> {
+    return this.releaseJobWithoutAttempt(id, lockToken, errorText, backoffMs);
   }
 
   /** Update job progress (token-fenced). */
