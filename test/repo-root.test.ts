@@ -232,6 +232,22 @@ describe('findRepoRoot', () => {
     expect(found.dir).toMatch(/[\\/]skills$/);
   });
 
+  it('compiled global executable finds a sibling home gbrain checkout', () => {
+    const cwd = scratch();
+    const runtimeHome = scratch();
+    const checkout = join(runtimeHome, 'gbrain');
+    seedRepo(checkout);
+    const fakeExecPath = join(runtimeHome, '.bun', 'bin', 'gbrain.exe');
+
+    const found = autoDetectSkillsDirReadOnly(cwd, {}, {
+      moduleUrl: 'bun:compiled/gbrain.exe',
+      execPath: fakeExecPath,
+    });
+
+    expect(found.dir).toBe(join(checkout, 'skills'));
+    expect(found.source).toBe('install_path');
+  });
+
   it('v0.31.7 D3-5: autoDetectSkillsDirReadOnly returns same primary detection on success', () => {
     // When primary detection succeeds, the read-only variant must return
     // the SAME result — no behavior drift, install-path is fallback only.

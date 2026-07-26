@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, parse } from 'path';
 import { resolveWhoknowsFixturePath, whoknowsHealthCheck } from '../src/commands/doctor.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -158,8 +158,36 @@ describe('whoknows_health doctor check', () => {
 
   it('returns null when the default fixture path cannot be resolved', () => {
     try {
-      const fixturePath = resolveWhoknowsFixturePath({}, 'not-a-file-url');
+      const fixturePath = resolveWhoknowsFixturePath(
+        {},
+        'not-a-file-url',
+        join(parse(workDir).root, 'definitely-no-gbrain-runtime', 'bin', 'gbrain.exe'),
+      );
       expect(fixturePath).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('resolves from a sibling home checkout for a compiled global executable', () => {
+    try {
+      const runtimeHome = join(workDir, 'home');
+      const checkout = join(runtimeHome, 'gbrain');
+      const fixturePath = join(checkout, 'test', 'fixtures', 'whoknows-eval.jsonl');
+      mkdirSync(join(checkout, 'src'), { recursive: true });
+      mkdirSync(join(checkout, 'skills'), { recursive: true });
+      mkdirSync(join(checkout, 'test', 'fixtures'), { recursive: true });
+      writeFileSync(join(checkout, 'src', 'cli.ts'), '// gbrain marker\n');
+      writeFileSync(join(checkout, 'skills', 'RESOLVER.md'), '# resolver\n');
+      writeFileSync(fixturePath, '{"query":"q","expected_top_3_slugs":["p"]}\n');
+
+      const resolved = resolveWhoknowsFixturePath(
+        {},
+        'bun:compiled/gbrain.exe',
+        join(runtimeHome, '.bun', 'bin', 'gbrain.exe'),
+      );
+
+      expect(resolved).toBe(fixturePath);
     } finally {
       cleanup();
     }

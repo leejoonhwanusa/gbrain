@@ -4,7 +4,10 @@ import * as db from '../core/db.ts';
 import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
 import { checkResolvable } from '../core/check-resolvable.ts';
 import { autoFixDryViolations, type AutoFixReport, type FixOutcome } from '../core/dry-fix.ts';
-import { autoDetectSkillsDirReadOnly } from '../core/repo-root.ts';
+import {
+  autoDetectSkillsDirReadOnly,
+  findGbrainSourceRootFromExecPath,
+} from '../core/repo-root.ts';
 import { loadOrDeriveManifest } from '../core/skill-manifest.ts';
 import { parseSkillFrontmatter } from '../core/skill-frontmatter.ts';
 import {
@@ -260,6 +263,7 @@ function findGbrainSourceRoot(startDir: string): string | null {
 export function resolveWhoknowsFixturePath(
   env: NodeJS.ProcessEnv = process.env,
   moduleUrl: string = import.meta.url,
+  execPath: string = process.execPath,
 ): string | null {
   if (env.GBRAIN_WHOKNOWS_FIXTURE_PATH) {
     return isAbsolute(env.GBRAIN_WHOKNOWS_FIXTURE_PATH)
@@ -280,6 +284,9 @@ export function resolveWhoknowsFixturePath(
     // Some bundlers/runtimes may not expose a normal file: import URL.
     // Doctor should surface an override hint instead of fabricating a path.
   }
+
+  const execRoot = findGbrainSourceRootFromExecPath(execPath);
+  if (execRoot) return join(execRoot, WHOKNOWS_FIXTURE_RELATIVE_PATH);
 
   return null;
 }

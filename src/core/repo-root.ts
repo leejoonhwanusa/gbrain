@@ -1,6 +1,6 @@
 import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { isAbsolute, join, resolve as resolvePath } from 'path';
+import { dirname, isAbsolute, join, resolve as resolvePath } from 'path';
 import { RESOLVER_FILENAMES, hasResolverFile } from './resolver-filenames.ts';
 import { isPathContained } from './path-confine.ts';
 
@@ -215,6 +215,41 @@ function isGbrainRepoRoot(dir: string): boolean {
 }
 
 /**
+ * Resolve a source checkout from a compiled executable path.
+ *
+ * Bun-compiled binaries expose a virtual import.meta.url, so the normal
+ * install-module walk cannot reach on-disk skills. A repository binary lives
+ * under `<checkout>/bin`; a global Bun binary commonly lives under
+ * `<home>/.bun/bin` with the checkout at `<home>/gbrain`. Walk only the
+ * executable's ancestors and those ancestors' exact `gbrain/` child, gated by
+ * the full repository shape and symlink-safe containment.
+ */
+export function findGbrainSourceRootFromExecPath(execPath: string): string | null {
+  let dir = dirname(resolvePath(execPath));
+  for (let i = 0; i < 12; i++) {
+    if (isGbrainRepoRoot(dir)) return dir;
+
+    const siblingCheckout = join(dir, 'gbrain');
+    if (
+      isGbrainRepoRoot(siblingCheckout) &&
+      isPathContained(siblingCheckout, dir)
+    ) {
+      return siblingCheckout;
+    }
+
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+export interface ReadOnlyRuntimeHints {
+  moduleUrl?: string;
+  execPath?: string;
+}
+
+/**
  * Read-only skills-dir detection (v0.31.7). Wraps `autoDetectSkillsDir` and
  * adds an install-path fallback when the primary detection returns null —
  * walks up from this module's install location to find a gbrain repo root,
@@ -238,6 +273,7 @@ function isGbrainRepoRoot(dir: string): boolean {
 export function autoDetectSkillsDirReadOnly(
   startDir: string = process.cwd(),
   env: NodeJS.ProcessEnv = process.env,
+  runtime: ReadOnlyRuntimeHints = {},
 ): SkillsDirDetection {
   const primary = autoDetectSkillsDir(startDir, env);
   if (primary.dir) return primary;
@@ -247,7 +283,7 @@ export function autoDetectSkillsDirReadOnly(
   // the install path lives inside an unrelated repo (e.g., a monorepo
   // that vendored gbrain in a subdir).
   try {
-    const moduleDir = fileURLToPath(import.meta.url);
+    const moduleDir = fileURLToPath(runtime.moduleUrl ?? import.meta.url);
     const installRoot = findRepoRoot(moduleDir);
     if (installRoot && isGbrainRepoRoot(installRoot)) {
       const skillsDir = join(installRoot, 'skills');
@@ -259,6 +295,15 @@ export function autoDetectSkillsDirReadOnly(
     // fileURLToPath can throw on malformed import.meta.url (rare; some
     // bundlers/runtimes). Fall through to the null detection — better to
     // refuse the fallback than to fabricate a path.
+  }
+
+  // Bun --compile uses a virtual module URL. Fall back to the executable's
+  // on-disk location and a strictly-shaped sibling checkout (for example
+  // ~/.bun/bin/gbrain + ~/gbrain). This remains read-only and cannot retarget
+  // skillpack/scaffold write paths because they use autoDetectSkillsDir().
+  const execRoot = findGbrainSourceRootFromExecPath(runtime.execPath ?? process.execPath);
+  if (execRoot) {
+    return { dir: join(execRoot, 'skills'), source: 'install_path' };
   }
 
   return primary; // null detection, source: null
