@@ -19,8 +19,8 @@
  * Idempotency: phase B only touches rows with row_num IS NULL. Re-runs
  * after a partial completion pick up where the previous run stopped.
  * Per-page atomic (.tmp + parse + rename, same primitive as
- * fence-write.ts). Dirty-tree refusal mirrors src/core/dry-fix.ts so
- * the user can review the diff before committing.
+ * fence-write.ts). Sources with pending fence writes are preflighted
+ * before any write so missing roots and dirty trees fail globally.
  *
  * Facts with NULL entity_slug are structurally unfenceable (no page to
  * fence onto). They're skipped with a warning; the operator decides
@@ -130,8 +130,8 @@ interface PhaseBOutcome {
 
 /**
  * Dirty-tree refusal: mirror src/core/dry-fix.ts behavior. Refuses to
- * write if any source's local_path has uncommitted changes. Dry-run
- * skips this check (no writes happen anyway).
+ * write if a source with pending fence writes has uncommitted changes.
+ * Dry-run skips this check (no writes happen anyway).
  */
 function isLocalPathDirty(localPath: string): boolean {
   try {
@@ -186,17 +186,6 @@ async function phaseBFenceFacts(
     const localPathById = new Map<string, string | null>();
     for (const s of sources) localPathById.set(s.id, s.local_path);
 
-    // Dirty-tree refusal: check every source's local_path before writing.
-    for (const [id, localPath] of localPathById) {
-      if (localPath && isLocalPathDirty(localPath)) {
-        return {
-          name: 'fence_facts',
-          status: 'failed',
-          detail: `source "${id}" has uncommitted changes in ${localPath}. Commit or stash, then re-run.`,
-        };
-      }
-    }
-
     // Walk legacy rows in (source_id, entity_slug) groups for per-page
     // atomic writes.
     const legacy = await engine.executeRaw<LegacyFactRow>(
@@ -206,6 +195,33 @@ async function phaseBFenceFacts(
         WHERE row_num IS NULL
         ORDER BY source_id, entity_slug, id`,
     );
+
+    // Preflight only sources that will receive fence writes. This keeps
+    // unrelated registered sources from blocking the migration while
+    // preserving an all-or-nothing gate for every actual write target.
+    const pendingWriteSourceIds = new Set<string>();
+    for (const row of legacy) {
+      if (row.entity_slug !== null && localPathById.get(row.source_id)) {
+        pendingWriteSourceIds.add(row.source_id);
+      }
+    }
+    for (const id of pendingWriteSourceIds) {
+      const localPath = localPathById.get(id)!;
+      if (!existsSync(localPath)) {
+        return {
+          name: 'fence_facts',
+          status: 'failed',
+          detail: `source "${id}" has pending facts but its local path is missing: ${localPath}. Restore the source or update its registration, then re-run.`,
+        };
+      }
+      if (isLocalPathDirty(localPath)) {
+        return {
+          name: 'fence_facts',
+          status: 'failed',
+          detail: `source "${id}" has uncommitted changes in ${localPath}. Commit or stash, then re-run.`,
+        };
+      }
+    }
 
     const outcome: PhaseBOutcome = {
       scanned: legacy.length,

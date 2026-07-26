@@ -14,6 +14,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { v0_32_2, __setTestEngineOverride, __testing } from '../src/commands/migrations/v0_32_2.ts';
@@ -38,6 +39,8 @@ beforeEach(async () => {
   brainDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-test-'));
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await (engine as any).db.query('DELETE FROM facts');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  await (engine as any).db.query(`DELETE FROM sources WHERE id <> 'default'`);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await (engine as any).db.query(
     `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
@@ -235,6 +238,42 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const rows = await (engine as any).db.query('SELECT row_num FROM facts');
     expect(rows.rows[0].row_num).toBeNull();
+  });
+
+  test('ignores a dirty registered source when it has no pending fence writes', async () => {
+    const unrelatedRepo = join(brainDir, 'unrelated-dirty-source');
+    mkdirSync(unrelatedRepo, { recursive: true });
+    execFileSync('git', ['init', unrelatedRepo], { stdio: 'ignore' });
+    writeFileSync(join(unrelatedRepo, 'wip.md'), 'uncommitted work\n', 'utf-8');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `INSERT INTO sources (id, name, local_path) VALUES ('unrelated', 'unrelated', $1)`,
+      [unrelatedRepo],
+    );
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Fence only the default source' });
+
+    const r = await __testing.phaseBFenceFacts(engine, OPTS);
+
+    expect(r.status).toBe('complete');
+    expect(r.detail).toContain('fenced=1');
+    expect(existsSync(join(brainDir, 'people/alice.md'))).toBe(true);
+  });
+
+  test('fails before writing when a source with pending facts has a missing local path', async () => {
+    const missingRepo = join(brainDir, 'removed-source');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+      [missingRepo],
+    );
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Do not recreate a removed source' });
+
+    const r = await __testing.phaseBFenceFacts(engine, OPTS);
+
+    expect(r.status).toBe('failed');
+    expect(r.detail).toContain('pending facts');
+    expect(r.detail).toContain('local path is missing');
+    expect(existsSync(missingRepo)).toBe(false);
   });
 });
 

@@ -5,6 +5,7 @@ All notable changes to GBrain will be documented in this file.
 ## Unreleased
 
 ### Fixed
+- **The v0.32.2 facts-fence migration no longer lets unrelated sources block or recreate removed source roots.** Its global preflight now checks only sources that actually have pending fence writes, rejects a missing required `local_path` before any filesystem write, and still refuses dirty write targets so the batch remains reviewable and all-or-nothing.
 - **Windows Minions supervisor commands now agree on the default PID file when `HOME` is unset.** The default uses the OS home directory instead of falling back to `/tmp`, so `doctor`, `jobs supervisor status`, and the running supervisor inspect the same brain-scoped PID file under the Windows user profile.
 - **Timed-out embedding backfills no longer disappear as false successes.** If an `embed-backfill` handler preserves durable partial progress and returns after the worker abort signal, the job moves back to `delayed` without consuming an attempt; a zero-progress abort still follows the bounded retry/dead-letter path. The worker also refuses to mark any post-abort handler return as `completed`.
 - **The TypeScript check accepts the fake-git argument delimiter fixture again.** The shell's `\037` unit-separator escape is now escaped at the surrounding template-literal boundary, preserving the generated script while avoiding TypeScript's forbidden octal-escape diagnostic.
