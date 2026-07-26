@@ -5,6 +5,7 @@ All notable changes to GBrain will be documented in this file.
 ## Unreleased
 
 ### Fixed
+- **Windows Minions supervisor commands now agree on the default PID file when `HOME` is unset.** The default uses the OS home directory instead of falling back to `/tmp`, so `doctor`, `jobs supervisor status`, and the running supervisor inspect the same brain-scoped PID file under the Windows user profile.
 - **Timed-out embedding backfills no longer disappear as false successes.** If an `embed-backfill` handler preserves durable partial progress and returns after the worker abort signal, the job moves back to `delayed` without consuming an attempt; a zero-progress abort still follows the bounded retry/dead-letter path. The worker also refuses to mark any post-abort handler return as `completed`.
 - **The TypeScript check accepts the fake-git argument delimiter fixture again.** The shell's `\037` unit-separator escape is now escaped at the surrounding template-literal boundary, preserving the generated script while avoiding TypeScript's forbidden octal-escape diagnostic.
 - **Existing PostgreSQL brains can upgrade through Life Chronicle migration v121.** The pre-schema bootstrap now adds `timeline_entries.event_page_id` before the latest schema blob creates its partial indexes, preserving the intended `bootstrap → schema replay → numbered migrations` order on schema v120 and older brains. PGLite and PostgreSQL regression tests cover the legacy-table shape; migration v121 still owns the foreign key and indexes.

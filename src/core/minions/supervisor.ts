@@ -43,6 +43,7 @@ import {
   writeSync,
 } from 'fs';
 import { dirname } from 'path';
+import { homedir } from 'os';
 import type { BrainEngine } from '../engine.ts';
 import { tryAcquireDbLock, type DbLockHandle } from '../db-lock.ts';
 import { currentBrainId } from './worker-registry.ts';
@@ -132,7 +133,7 @@ export interface SupervisorOpts {
 export const DEFAULT_PID_FILE: string = (() => {
   const envOverride = process.env.GBRAIN_SUPERVISOR_PID_FILE;
   if (envOverride && envOverride.length > 0) return envOverride;
-  const home = process.env.HOME ?? '/tmp';
+  const home = process.env.HOME || homedir();
   // #1849: key the default pidfile on the brain id so two DIFFERENT brains
   // under one HOME don't share `supervisor.pid` and falsely block each other's
   // pidfile guard. Derived from config (no DB connect), so it's safe to
