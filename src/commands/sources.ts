@@ -87,6 +87,7 @@ interface SourceListEntry {
   federated: boolean;
   page_count: number;
   last_sync_at: string | null;
+  archived: boolean;
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -331,6 +332,7 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
       federated: isFederated(r.config),
       page_count: pageCount,
       last_sync_at: r.last_sync_at ? new Date(r.last_sync_at).toISOString() : null,
+      archived: r.archived === true,
     });
   }
 
@@ -343,7 +345,7 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
   console.log('SOURCES');
   console.log('───────');
   for (const e of entries) {
-    const fedMark = e.federated ? 'federated' : (e as any).archived ? '⚠ archived' : 'isolated';
+    const fedMark = e.archived ? '⚠ archived' : e.federated ? 'federated' : 'isolated';
     const pathStr = e.local_path ?? '(no local path)';
     const sync = e.last_sync_at ? `last sync ${e.last_sync_at}` : 'never synced';
     console.log(`  ${e.id.padEnd(20)}  ${fedMark.padEnd(12)}  ${String(e.page_count).padStart(6)} pages  ${sync}`);
@@ -727,6 +729,32 @@ async function runFederate(engine: BrainEngine, args: string[], value: boolean):
     // Federation flip already succeeded; embed-backfill is a follow-up nicety.
     console.error(`  → embed-backfill submission failed (flip succeeded): ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+// ── Subcommand: enable-sync / disable-sync ─────────────────
+
+async function runSyncEnabled(engine: BrainEngine, args: string[], value: boolean): Promise<void> {
+  const id = args[0];
+  if (!id) {
+    console.error(`Usage: gbrain sources ${value ? 'enable-sync' : 'disable-sync'} <id>`);
+    process.exit(2);
+  }
+  const src = await fetchSource(engine, id);
+  if (!src) {
+    console.error(`Source "${id}" not found.`);
+    process.exit(4);
+  }
+  const config = parseConfig(src.config);
+  config.syncEnabled = value;
+  await engine.executeRaw(
+    `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
+    [JSON.stringify(config), id],
+  );
+  console.log(
+    value
+      ? `Source "${id}" is enabled for sync and maintenance.`
+      : `Source "${id}" is disabled for sync and maintenance; its data is preserved.`,
+  );
 }
 
 // ── v0.40 sources status (D12) ──────────────────────────────
@@ -1331,6 +1359,8 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'detach':     runDetach(); return;
     case 'federate':   return runFederate(engine, rest, true);
     case 'unfederate': return runFederate(engine, rest, false);
+    case 'enable-sync':  return runSyncEnabled(engine, rest, true);
+    case 'disable-sync': return runSyncEnabled(engine, rest, false);
     case 'archive':    return runArchive(engine, rest);
     case 'restore':    return runRestore(engine, rest);
     case 'purge':      return runPurge(engine, rest);
@@ -1398,6 +1428,8 @@ Subcommands:
                                     targeting the brain you think you are.
   federate <id>                     Make source appear in cross-source default search.
   unfederate <id>                   Isolate source from default search.
+  enable-sync <id>                  Include source in sync, maintenance, and freshness checks.
+  disable-sync <id>                 Exclude an offline source without deleting its data.
   set-cr-mode <id> <none|title|per_chunk_synopsis>
                                     Per-source contextual retrieval mode
                                     override (v0.40.3.0). Pass "unset" or

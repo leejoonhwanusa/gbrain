@@ -24,7 +24,8 @@
  *    the FS walk into one array, then run ONE SELECT against pages with a
  *    VALUES clause. NOT a per-file loop (which would be 20K round trips on
  *    a 10K-file source).
- *  - Time + size bounds: cap the walk at 10K files OR 5s. Bail with a "check
+ *  - Time + size bounds: cap each source at 10K files and the full walk at
+ *    15s. Bail with a "check
  *    skipped, walk too large" status instead of letting doctor hang.
  *  - Wrapper try/catch around the walk per OV13: ENOENT/EACCES on local_path
  *    yields zero files, NOT a thrown crash that takes down the whole doctor
@@ -34,7 +35,13 @@
 import { readdirSync, lstatSync, statSync } from 'fs';
 import { join, relative } from 'path';
 import type { BrainEngine } from './engine.ts';
-import { pathToSlug } from './sync.ts';
+import {
+  isSyncable,
+  loadGbrainIgnoreGlobs,
+  matchesGbrainIgnorePath,
+  pathToSlug,
+  pruneDir,
+} from './sync.ts';
 
 export interface SourceWithPath {
   id: string;
@@ -56,7 +63,7 @@ export interface MisroutedResult {
 }
 
 const DEFAULT_FILE_LIMIT = 10_000;
-const DEFAULT_TIMEOUT_MS = 5_000;
+const DEFAULT_MULTI_SOURCE_DRIFT_TIMEOUT_MS = 15_000;
 const SAMPLE_LIMIT = 5;
 
 /**
@@ -72,11 +79,17 @@ function walkMarkdownAndMdxFiles(
   root: string,
   limit: number,
   deadlineMs: number,
+  excludePatterns: string[] = [],
 ): { files: { relPath: string }[]; truncated: boolean } {
   const files: { relPath: string }[] = [];
+  const ignoredDirectoryPatterns = excludePatterns.filter((pattern) => pattern.endsWith('/**'));
   let truncated = false;
   function walk(d: string): void {
     if (truncated) return;
+    if (Date.now() >= deadlineMs) {
+      truncated = true;
+      return;
+    }
     let entries: string[];
     try {
       entries = readdirSync(d);
@@ -86,6 +99,10 @@ function walkMarkdownAndMdxFiles(
     }
     for (const entry of entries) {
       if (truncated) return;
+      if (Date.now() >= deadlineMs) {
+        truncated = true;
+        return;
+      }
       if (entry.startsWith('.')) continue;
       const full = join(d, entry);
       let isDir = false;
@@ -95,20 +112,22 @@ function walkMarkdownAndMdxFiles(
         continue;
       }
       if (isDir) {
+        if (!pruneDir(entry, d)) continue;
+        const relDir = relative(root, full).replace(/\\/g, '/');
+        if (
+          ignoredDirectoryPatterns.length > 0
+          && matchesGbrainIgnorePath(`${relDir}/__gbrain_walk_probe__`, ignoredDirectoryPatterns)
+        ) continue;
         walk(full);
         continue;
       }
       const isMd = entry.endsWith('.md') || entry.endsWith('.mdx');
       if (!isMd) continue;
       if (entry.startsWith('_')) continue; // matches extract.ts convention
-      files.push({ relPath: relative(root, full) });
+      const relPath = relative(root, full).replace(/\\/g, '/');
+      if (!isSyncable(relPath, { strategy: 'markdown', exclude: excludePatterns })) continue;
+      files.push({ relPath });
       if (files.length >= limit) {
-        truncated = true;
-        return;
-      }
-      // Time check is cheap; do it on every push so a slow filesystem can't
-      // run unbounded.
-      if (Date.now() >= deadlineMs) {
         truncated = true;
         return;
       }
@@ -178,7 +197,7 @@ export async function findMisroutedPages(
   opts: { limit?: number; timeoutMs?: number } = {},
 ): Promise<MisroutedResult> {
   const limit = opts.limit ?? DEFAULT_FILE_LIMIT;
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_MULTI_SOURCE_DRIFT_TIMEOUT_MS;
   const deadlineMs = Date.now() + timeoutMs;
 
   let totalCount = 0;
@@ -192,7 +211,8 @@ export async function findMisroutedPages(
       walkTruncated = true;
       break;
     }
-    const { files, truncated } = walkMarkdownAndMdxFiles(src.local_path, limit, deadlineMs);
+    const exclude = loadGbrainIgnoreGlobs(src.local_path);
+    const { files, truncated } = walkMarkdownAndMdxFiles(src.local_path, limit, deadlineMs, exclude);
     if (truncated) walkTruncated = true;
     if (files.length === 0) continue;
 

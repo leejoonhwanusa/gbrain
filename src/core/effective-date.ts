@@ -98,6 +98,15 @@ function validateInRange(d: Date | null): Date | null {
   return d;
 }
 
+/**
+ * Parse one frontmatter date candidate using the exact range rules applied by
+ * computeEffectiveDate(). Doctor uses this instead of treating mere JSON-key
+ * presence as proof that a value is parseable.
+ */
+export function parseEffectiveDateCandidate(value: unknown): Date | null {
+  return validateInRange(parseDateLoose(value));
+}
+
 function extractFilenameDate(filename: string | null | undefined): Date | null {
   if (!filename) return null;
   const m = filename.match(FILENAME_DATE_RE);
@@ -121,9 +130,9 @@ export function computeEffectiveDate(opts: ComputeEffectiveDateOpts): EffectiveD
   const { slug, frontmatter, filename, updatedAt, createdAt } = opts;
   const filenameFirst = hasFilenameFirstPrefix(slug);
 
-  const fmEvent = validateInRange(parseDateLoose(frontmatter.event_date));
-  const fmDate = validateInRange(parseDateLoose(frontmatter.date));
-  const fmPublished = validateInRange(parseDateLoose(frontmatter.published));
+  const fmEvent = parseEffectiveDateCandidate(frontmatter.event_date);
+  const fmDate = parseEffectiveDateCandidate(frontmatter.date);
+  const fmPublished = parseEffectiveDateCandidate(frontmatter.published);
   const filenameDate = extractFilenameDate(filename);
 
   // Build the ordered candidate list. For filename-first prefixes

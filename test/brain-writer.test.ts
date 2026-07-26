@@ -254,6 +254,20 @@ describe('scanBrainSources (PGLite)', () => {
     expect(beta.errors_by_code.NESTED_QUOTES).toBeGreaterThanOrEqual(1);
   });
 
+  test('honors source-local .gbrainignore during frontmatter scans', async () => {
+    mkdirSync(join(tmp, 'ignored'), { recursive: true });
+    writeFileSync(join(tmp, '.gbrainignore'), 'ignored/**\n');
+    writeFileSync(
+      join(tmp, 'ignored', 'broken.md'),
+      `${fence}\ntype: x\ntitle: ok\n${fence}\n\nbody\x00`,
+    );
+    await registerSource('ignore-aware', tmp);
+
+    const report = await scanBrainSources(engine, { sourceId: 'ignore-aware' });
+    expect(report.ok).toBe(true);
+    expect(report.total).toBe(0);
+  });
+
   test('respects sourceId filter', async () => {
     const srcA = join(tmp, 'a');
     const srcB = join(tmp, 'b');

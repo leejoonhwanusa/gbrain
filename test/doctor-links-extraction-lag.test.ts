@@ -67,6 +67,34 @@ describe('links_extraction_lag doctor check', () => {
     expect(c.message).toContain('Extraction current');
   });
 
+  test('archived-source pages are excluded from both lag buckets', async () => {
+    await seedPages(100);
+    await engine.executeRaw(`UPDATE pages SET links_extracted_at = now()`);
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config, archived)
+       VALUES ('archived-backup', 'Archived backup', '{}'::jsonb, true)`,
+    );
+    await seedPages(120, 'archived-backup', 'old');
+
+    const c = await checkLinksExtractionLag(engine);
+    expect(c.status).toBe('ok');
+    expect(c.details).toMatchObject({ total: 100, stale: 0 });
+  });
+
+  test('sync-disabled source pages are excluded from both lag buckets', async () => {
+    await seedPages(100);
+    await engine.executeRaw(`UPDATE pages SET links_extracted_at = now()`);
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config, archived)
+       VALUES ('offline-agent', 'Offline agent', '{"syncEnabled":false}'::jsonb, false)`,
+    );
+    await seedPages(120, 'offline-agent', 'offline');
+
+    const c = await checkLinksExtractionLag(engine);
+    expect(c.status).toBe('ok');
+    expect(c.details).toMatchObject({ total: 100, stale: 0 });
+  });
+
   test('warn-only by default: 100% stale does NOT fail without fail-pct', async () => {
     await seedPages(120);
     const c = await checkLinksExtractionLag(engine);

@@ -1676,7 +1676,8 @@ export async function registerBuiltinHandlers(
 
     // v0.38 (codex r1 P1-2 + P1-5): per-source dispatch threading.
     //   - source_id: when set, runCycle uses the per-source lock ID and
-    //     writes last_full_cycle_at on success. Validated at handler entry
+    //     writes last_source_cycle_at on success. A full phase selection also
+    //     writes legacy last_full_cycle_at. Validated at handler entry
     //     so queue replays with malformed source_id dead-letter instead of
     //     reaching cycle code.
     //   - pull: when set, overrides the legacy hardcoded `true` so
@@ -1811,7 +1812,8 @@ export async function registerBuiltinHandlers(
 
     // Stamp last_global_at only on a non-failed run so a failed pass stays stale
     // and re-dispatches next tick (self-healing retry).
-    if (report.status === 'ok' || report.status === 'clean' || report.status === 'partial') {
+    const completedGlobalSelection = GLOBAL_PHASES.every((phase) => phases.includes(phase));
+    if (completedGlobalSelection && (report.status === 'ok' || report.status === 'clean' || report.status === 'partial')) {
       try {
         await engine.setConfig(LAST_GLOBAL_AT_KEY, new Date().toISOString());
       } catch (e) {

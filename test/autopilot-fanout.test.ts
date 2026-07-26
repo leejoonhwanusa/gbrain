@@ -72,6 +72,11 @@ describe('isSourceStale', () => {
     expect(isSourceStale(src('a', past), NOW, 5)).toBe(true);
     expect(isSourceStale(src('a', past), NOW, 60)).toBe(false);
   });
+  test('last_source_cycle_at takes precedence over stale legacy full timestamp', () => {
+    const staleFull = new Date(NOW - 3 * 60 * 60_000).toISOString();
+    const freshSource = new Date(NOW - 10 * 60_000).toISOString();
+    expect(isSourceStale(src('a', staleFull, { last_source_cycle_at: freshSource }), NOW)).toBe(false);
+  });
 });
 
 describe('selectSourcesForDispatch', () => {
@@ -90,6 +95,16 @@ describe('selectSourcesForDispatch', () => {
     expect(result.skippedCap).toEqual([]);
   });
 
+  test('sync-disabled source is excluded from maintenance dispatch', () => {
+    const result = selectSourcesForDispatch(
+      [src('offline', undefined, { syncEnabled: false }), src('active')],
+      10,
+      NOW,
+    );
+    expect(result.dispatch.map(s => s.id)).toEqual(['active']);
+    expect(result.skippedDisabled.map(s => s.id)).toEqual(['offline']);
+  });
+
   test('never-cycled (NULL) sorts before timestamped', () => {
     const result = selectSourcesForDispatch(
       [fresh('b', 90), src('a'), fresh('c', 120)],
@@ -99,6 +114,18 @@ describe('selectSourcesForDispatch', () => {
     // 'a' has no last_full_cycle_at → -Infinity → sorts first
     // then 'c' (120min ago, older) before 'b' (90min ago, newer)
     expect(result.dispatch.map(s => s.id)).toEqual(['a', 'c', 'b']);
+  });
+
+  test('oldest-first ordering uses last_source_cycle_at before legacy full timestamp', () => {
+    const newestLegacy = new Date(NOW - 90 * 60_000).toISOString();
+    const oldestSource = new Date(NOW - 180 * 60_000).toISOString();
+    const other = new Date(NOW - 120 * 60_000).toISOString();
+    const result = selectSourcesForDispatch(
+      [src('a', newestLegacy, { last_source_cycle_at: oldestSource }), src('b', other)],
+      10,
+      NOW,
+    );
+    expect(result.dispatch.map(s => s.id)).toEqual(['a', 'b']);
   });
 
   test('cap honored; overflow goes to skippedCap', () => {

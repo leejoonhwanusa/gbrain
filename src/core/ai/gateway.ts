@@ -89,7 +89,21 @@ function withDefaultTimeout(caller: AbortSignal | undefined, timeoutMs: number):
   return caller ? AbortSignal.any([caller, timeout]) : timeout;
 }
 
-const MAX_CHARS = 8000;
+const HARD_MAX_EMBED_CHARS = 8000;
+
+/**
+ * Local embedding servers can expose a smaller context than hosted providers.
+ * Keep the historical 8000-char ceiling by default, while allowing an
+ * operator to lower it without weakening the global hard cap.
+ */
+export function resolveEmbeddingMaxChars(raw: string | undefined): number {
+  if (raw === undefined) return HARD_MAX_EMBED_CHARS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1) return HARD_MAX_EMBED_CHARS;
+  return Math.min(Math.floor(parsed), HARD_MAX_EMBED_CHARS);
+}
+
+const AI_EMBED_MAX_CHARS = resolveEmbeddingMaxChars(process.env.GBRAIN_AI_EMBED_MAX_CHARS);
 // v0.36.0.0 (D3 + D4): ZeroEntropy zembed-1 at 1280d via Matryoshka is the
 // new default for embedding. Real-corpus benchmark across 20 queries:
 //   - ZE wins 11/20 (OpenAI 6, Voyage 4)
@@ -1253,14 +1267,15 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
 const MIN_SUB_BATCH = 1;
 
 /**
- * Embed many texts. Truncates to MAX_CHARS, then dispatches based on whether
+ * Embed many texts. Truncates to the resolved per-process character ceiling,
+ * then dispatches based on whether
  * the recipe declares a per-batch token budget.
  *
  * Flow:
  * ```
  * embed(texts)
  *   ├─ resolve recipe + model
- *   ├─ truncate each text to MAX_CHARS (8000)
+ *   ├─ truncate each text to GBRAIN_AI_EMBED_MAX_CHARS (hard max 8000)
  *   ├─ read recipe.touchpoints.embedding.{max_batch_tokens, chars_per_token, safety_factor}
  *   │
  *   ├─ if max_batch_tokens declared (Voyage path):
@@ -1356,7 +1371,7 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   const resolveTarget = opts?.embeddingModel ?? getEmbeddingModel();
   const tracker = __budgetStore.getStore() ?? null;
   const { model, recipe, modelId } = await resolveEmbeddingProvider(resolveTarget);
-  const truncated = texts.map(t => (t ?? '').slice(0, MAX_CHARS));
+  const truncated = texts.map(t => (t ?? '').slice(0, AI_EMBED_MAX_CHARS));
 
   // Reserve up front for the worst-case batch token count. Embeddings have
   // no output rate, so maxOutputTokens=0. record() at the end uses the

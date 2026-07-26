@@ -128,13 +128,13 @@ describe('autopilot-global-maintenance handler stamps last_global_at (PGLite)', 
     return handlers;
   }
 
-  test('runs global phases (no source_id) and stamps autopilot.last_global_at on success', async () => {
+  test('runs all global phases (no source_id) and stamps autopilot.last_global_at on success', async () => {
     expect(await engine.getConfig(LAST_GLOBAL_AT_KEY)).toBeNull();
     const handlers = await captureHandlers();
     const handler = handlers.get('autopilot-global-maintenance');
     expect(handler).toBeTruthy();
 
-    const result = await handler!({ data: { phases: ['orphans', 'embed'] }, signal: undefined });
+    const result = await handler!({ data: { phases: GLOBAL_PHASES }, signal: undefined });
     // The cycle ran the requested global phases (DB-only on an empty brain).
     expect(result.report.phases.some((p: any) => p.phase === 'orphans')).toBe(true);
     expect(['ok', 'clean', 'partial']).toContain(result.report.status);
@@ -142,5 +142,16 @@ describe('autopilot-global-maintenance handler stamps last_global_at (PGLite)', 
     const stamped = await engine.getConfig(LAST_GLOBAL_AT_KEY);
     expect(stamped).not.toBeNull();
     expect(Number.isFinite(new Date(stamped!).getTime())).toBe(true);
+  });
+
+  test('subset of global phases does not claim global freshness', async () => {
+    expect(await engine.getConfig(LAST_GLOBAL_AT_KEY)).toBeNull();
+    const handlers = await captureHandlers();
+    const handler = handlers.get('autopilot-global-maintenance');
+    expect(handler).toBeTruthy();
+
+    const result = await handler!({ data: { phases: ['orphans'] }, signal: undefined });
+    expect(['ok', 'clean', 'partial']).toContain(result.report.status);
+    expect(await engine.getConfig(LAST_GLOBAL_AT_KEY)).toBeNull();
   });
 });

@@ -63,6 +63,16 @@ describe('Bug 11 — brain_score breakdown sums to total', () => {
     expect(sum).toBe(h.brain_score);
   });
 
+  test('code and narrative inventory do not create fake graph debt', async () => {
+    await engine.putPage('src/example', { type: 'code', title: 'code', compiled_truth: 'const x = 1', frontmatter: {} });
+    await engine.putPage('docs/readme', { type: 'note', title: 'readme', compiled_truth: 'documentation', frontmatter: {} });
+    const h = await engine.getHealth();
+    expect(h.orphan_pages).toBe(0);
+    expect(h.link_density_score).toBe(25);
+    expect(h.timeline_coverage_score).toBe(15);
+    expect(h.no_orphans_score).toBe(15);
+  });
+
   test('brain_score caps at 100', async () => {
     const h = await engine.getHealth();
     expect(h.brain_score).toBeGreaterThanOrEqual(0);
@@ -75,10 +85,10 @@ describe('Bug 11 — orphan_pages is "no inbound links"', () => {
     // Hub page: links out to three others, but nothing links back to it.
     // Previous (buggy) behavior: hub counted as orphan because it had no
     // inbound links (correct) AND the old query also required no outbound.
-    await engine.putPage('hub', { type: 'note', title: 'Hub', compiled_truth: 'index', frontmatter: {} });
-    await engine.putPage('leaf1', { type: 'note', title: 'L1', compiled_truth: 'x', frontmatter: {} });
-    await engine.putPage('leaf2', { type: 'note', title: 'L2', compiled_truth: 'y', frontmatter: {} });
-    await engine.putPage('leaf3', { type: 'note', title: 'L3', compiled_truth: 'z', frontmatter: {} });
+    await engine.putPage('hub', { type: 'entity', title: 'Hub', compiled_truth: 'index', frontmatter: {} });
+    await engine.putPage('leaf1', { type: 'entity', title: 'L1', compiled_truth: 'x', frontmatter: {} });
+    await engine.putPage('leaf2', { type: 'entity', title: 'L2', compiled_truth: 'y', frontmatter: {} });
+    await engine.putPage('leaf3', { type: 'entity', title: 'L3', compiled_truth: 'z', frontmatter: {} });
 
     const hubId = (await (engine as any).db.query(`SELECT id FROM pages WHERE slug='hub'`)).rows[0].id;
     for (const target of ['leaf1', 'leaf2', 'leaf3']) {
@@ -97,14 +107,14 @@ describe('Bug 11 — orphan_pages is "no inbound links"', () => {
   });
 
   test('a page with no links at all IS an orphan', async () => {
-    await engine.putPage('loner', { type: 'note', title: 'Loner', compiled_truth: 'alone', frontmatter: {} });
+    await engine.putPage('loner', { type: 'entity', title: 'Loner', compiled_truth: 'alone', frontmatter: {} });
     const h = await engine.getHealth();
     expect(h.orphan_pages).toBe(1);
   });
 
   test('a page with inbound links only is NOT an orphan', async () => {
-    await engine.putPage('sink', { type: 'note', title: 'Sink', compiled_truth: 'target', frontmatter: {} });
-    await engine.putPage('source', { type: 'note', title: 'Source', compiled_truth: 'origin', frontmatter: {} });
+    await engine.putPage('sink', { type: 'entity', title: 'Sink', compiled_truth: 'target', frontmatter: {} });
+    await engine.putPage('source', { type: 'entity', title: 'Source', compiled_truth: 'origin', frontmatter: {} });
     const sinkId = (await (engine as any).db.query(`SELECT id FROM pages WHERE slug='sink'`)).rows[0].id;
     const srcId = (await (engine as any).db.query(`SELECT id FROM pages WHERE slug='source'`)).rows[0].id;
     await (engine as any).db.query(

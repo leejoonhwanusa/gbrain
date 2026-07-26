@@ -149,7 +149,11 @@ export function parseResolverEntries(resolverContent: string): ResolverEntry[] {
   const entries: ResolverEntry[] = [];
   let currentSection = '';
 
-  for (const line of resolverContent.split('\n')) {
+  // Normalize Windows CRLF at the line boundary. Leaving the trailing
+  // carriage return on compact-list rows makes the terminal `(.+)$`
+  // capture fail, while table rows happen to survive because they trim
+  // columns independently.
+  for (const line of resolverContent.split(/\r?\n/)) {
     // Track section headings
     const headingMatch = line.match(/^##\s+(.+)/);
     if (headingMatch) {

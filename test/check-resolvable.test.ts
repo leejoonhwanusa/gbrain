@@ -99,6 +99,18 @@ describe("parseResolverEntries", () => {
     expect(entries.every(e => e.skillPath === "skills/flight-tracker/SKILL.md")).toBe(true);
   });
 
+  test("[list] Windows CRLF rows parse identically", () => {
+    const content = [
+      "## Personal",
+      "- **gift-advisor**: gift idea | birthday gift",
+      "",
+    ].join("\r\n");
+    const entries = parseResolverEntries(content);
+    expect(entries.map(e => e.trigger)).toEqual(["gift idea", "birthday gift"]);
+    expect(entries.every(e => e.skillPath === "skills/gift-advisor/SKILL.md")).toBe(true);
+    expect(entries.every(e => e.section === "Personal")).toBe(true);
+  });
+
   test("[list] plain-name fallback (no bold markers)", () => {
     const content = `- gift-advisor: gift idea | birthday gift`;
     const entries = parseResolverEntries(content);

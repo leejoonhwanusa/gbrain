@@ -146,6 +146,16 @@ describe('whoknows_health doctor check', () => {
     }
   });
 
+  it('resolves the fixture from cwd when a compiled module URL is unavailable', () => {
+    try {
+      process.chdir(savedCwd);
+      const fixturePath = resolveWhoknowsFixturePath({}, 'not-a-file-url');
+      expect(fixturePath).toBe(join(savedCwd, 'test/fixtures/whoknows-eval.jsonl'));
+    } finally {
+      cleanup();
+    }
+  });
+
   it('returns null when the default fixture path cannot be resolved', () => {
     try {
       const fixturePath = resolveWhoknowsFixturePath({}, 'not-a-file-url');

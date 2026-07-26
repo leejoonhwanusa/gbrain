@@ -18,9 +18,17 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 OUT_BIN="$(mktemp /tmp/gbrain-img-decoders-check.XXXXXX)"
+rm -f "$OUT_BIN"
+BUN_OUT="$OUT_BIN"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    OUT_BIN="${OUT_BIN}.exe"
+    BUN_OUT="$(cygpath -w "$OUT_BIN")"
+    ;;
+esac
 trap 'rm -f "$OUT_BIN"' EXIT
 
-bun build --compile --outfile "$OUT_BIN" scripts/image-decoders-smoketest.ts >/dev/null 2>&1
+bun build --compile --outfile "$BUN_OUT" scripts/image-decoders-smoketest.ts >/dev/null 2>&1
 
 OUTPUT="$("$OUT_BIN" 2>&1 || true)"
 

@@ -229,7 +229,7 @@ describe('findRepoRoot', () => {
     // path resolves to the repo's skills dir.
     expect(found.dir).not.toBeNull();
     expect(found.source).toBe('install_path');
-    expect(found.dir).toMatch(/\/skills$/);
+    expect(found.dir).toMatch(/[\\/]skills$/);
   });
 
   it('v0.31.7 D3-5: autoDetectSkillsDirReadOnly returns same primary detection on success', () => {

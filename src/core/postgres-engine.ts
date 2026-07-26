@@ -2475,7 +2475,7 @@ export class PostgresEngine implements BrainEngine {
   // ── v0.42.7 (#1696): link/timeline extraction freshness watermark ──
 
   /** Shared stale-for-extraction predicate. Returns `{ where, params }`. */
-  private buildStalePagesWhere(opts?: { sourceId?: string; versionTs?: string }): { where: string; params: unknown[] } {
+  private buildStalePagesWhere(opts?: { sourceId?: string; versionTs?: string; excludeArchived?: boolean; excludeSyncDisabled?: boolean }): { where: string; params: unknown[] } {
     const conds: string[] = ['deleted_at IS NULL'];
     const params: unknown[] = [];
     if (opts?.versionTs) {
@@ -2488,10 +2488,16 @@ export class PostgresEngine implements BrainEngine {
       params.push(opts.sourceId);
       conds.push(`source_id = $${params.length}`);
     }
+    if (opts?.excludeArchived) {
+      conds.push('NOT EXISTS (SELECT 1 FROM sources s WHERE s.id = pages.source_id AND s.archived IS TRUE)');
+    }
+    if (opts?.excludeSyncDisabled) {
+      conds.push("NOT EXISTS (SELECT 1 FROM sources s WHERE s.id = pages.source_id AND (s.config ->> 'syncEnabled') = 'false')");
+    }
     return { where: conds.join(' AND '), params };
   }
 
-  async countStalePagesForExtraction(opts?: { sourceId?: string; versionTs?: string }): Promise<number> {
+  async countStalePagesForExtraction(opts?: { sourceId?: string; versionTs?: string; excludeArchived?: boolean; excludeSyncDisabled?: boolean }): Promise<number> {
     const { where, params } = this.buildStalePagesWhere(opts);
     const rows = await this.sql.unsafe(
       `SELECT count(*)::int AS count FROM pages WHERE ${where}`,
@@ -4997,54 +5003,77 @@ export class PostgresEngine implements BrainEngine {
     // number. A hub page that links out to many but has no back-references
     // is working as intended, not an orphan.
     const [h] = await sql`
-      WITH entity_pages AS (
-        SELECT id, slug FROM pages WHERE type IN ('person', 'company')
+      WITH active_pages AS (
+        SELECT p.*
+          FROM pages p
+         WHERE p.deleted_at IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM sources s
+              WHERE s.id = p.source_id
+                AND (s.archived IS TRUE OR (s.config ->> 'syncEnabled') = 'false')
+           )
+      ), score_pages AS (
+        SELECT id, slug
+          FROM active_pages
+         WHERE type IN ('entity', 'person', 'company', 'organization')
+           AND slug NOT LIKE 'tools/gbrain/test/%'
+           AND slug NOT LIKE 'test/%'
+           AND slug <> 'templates/new-person'
       )
       SELECT
-        (SELECT count(*) FROM pages) as page_count,
-        (SELECT count(*) FROM content_chunks WHERE embedded_at IS NOT NULL)::float /
-          GREATEST((SELECT count(*) FROM content_chunks), 1)::float as embed_coverage,
-        (SELECT count(*) FROM pages p
+        (SELECT count(*) FROM active_pages) as page_count,
+        (SELECT count(*) FROM score_pages) as score_page_count,
+        (SELECT count(*) FROM content_chunks c JOIN active_pages p ON p.id = c.page_id WHERE c.embedded_at IS NOT NULL)::float /
+          GREATEST((SELECT count(*) FROM content_chunks c JOIN active_pages p ON p.id = c.page_id), 1)::float as embed_coverage,
+        (SELECT count(*) FROM active_pages p
          WHERE p.updated_at < (SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id)
         ) as stale_pages,
-        (SELECT count(*) FROM pages p
-         WHERE NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
-           AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)
+        (SELECT count(*) FROM score_pages p
+         WHERE NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id OR l.from_page_id = p.id)
         ) as orphan_pages,
         (SELECT count(*) FROM links l
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
         ) as dead_links,
-        (SELECT count(*) FROM content_chunks WHERE embedded_at IS NULL) as missing_embeddings,
-        (SELECT count(*) FROM links) as link_count,
-        (SELECT count(DISTINCT page_id) FROM timeline_entries) as pages_with_timeline,
-        (SELECT count(*) FROM entity_pages e
+        (SELECT count(*) FROM content_chunks c JOIN active_pages p ON p.id = c.page_id WHERE c.embedded_at IS NULL) as missing_embeddings,
+        (SELECT count(*) FROM score_pages p
+         WHERE EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id OR l.from_page_id = p.id)) as connected_pages,
+        (SELECT count(*) FROM score_pages p
+         WHERE EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id)) as pages_with_timeline,
+        (SELECT count(*) FROM score_pages e
          WHERE EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = e.id))::float /
-          GREATEST((SELECT count(*) FROM entity_pages), 1)::float as link_coverage,
-        (SELECT count(*) FROM entity_pages e
+          GREATEST((SELECT count(*) FROM score_pages), 1)::float as link_coverage,
+        (SELECT count(*) FROM score_pages e
          WHERE EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = e.id))::float /
-          GREATEST((SELECT count(*) FROM entity_pages), 1)::float as timeline_coverage
+          GREATEST((SELECT count(*) FROM score_pages), 1)::float as timeline_coverage
     `;
 
     const connected = await sql`
       SELECT p.slug,
              (SELECT count(*) FROM links l WHERE l.from_page_id = p.id OR l.to_page_id = p.id)::int as link_count
       FROM pages p
-      WHERE p.type IN ('person', 'company')
+      WHERE p.deleted_at IS NULL
+        AND p.type IN ('entity', 'person', 'company', 'organization')
+        AND NOT EXISTS (
+          SELECT 1 FROM sources s
+           WHERE s.id = p.source_id
+             AND (s.archived IS TRUE OR (s.config ->> 'syncEnabled') = 'false')
+        )
       ORDER BY link_count DESC
       LIMIT 5
     `;
 
     const pageCount = Number(h.page_count);
+    const scorePageCount = Number(h.score_page_count);
     const embedCoverage = Number(h.embed_coverage);
     const orphanPages = Number(h.orphan_pages);
     const deadLinks = Number(h.dead_links);
-    const linkCount = Number(h.link_count);
+    const connectedPages = Number(h.connected_pages);
     const pagesWithTimeline = Number(h.pages_with_timeline);
 
     // brain_score: 0-100 weighted average
-    const linkDensity = pageCount > 0 ? Math.min(linkCount / pageCount, 1) : 0;
-    const timelineCoverageWhole = pageCount > 0 ? Math.min(pagesWithTimeline / pageCount, 1) : 0;
-    const noOrphans = pageCount > 0 ? 1 - (orphanPages / pageCount) : 1;
+    const linkDensity = scorePageCount > 0 ? connectedPages / scorePageCount : 1;
+    const timelineCoverageWhole = scorePageCount > 0 ? pagesWithTimeline / scorePageCount : 1;
+    const noOrphans = scorePageCount > 0 ? 1 - (orphanPages / scorePageCount) : 1;
     const noDeadLinks = pageCount > 0 ? 1 - Math.min(deadLinks / pageCount, 1) : 1;
     // Per-component points. Sum equals brainScore by construction.
     //

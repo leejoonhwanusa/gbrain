@@ -33,6 +33,17 @@ const TEST_WORKFLOW = resolve(REPO_ROOT, '.github/workflows/test.yml');
 describe('check-privacy.sh CI wiring', () => {
   it('scripts/check-privacy.sh exists and is executable', () => {
     expect(existsSync(PRIVACY_SCRIPT)).toBe(true);
+    if (process.platform === 'win32') {
+      // NTFS does not expose the POSIX executable bit through stat(). Git's
+      // index mode is the portable source of truth for the checkout contract.
+      const indexed = spawnSync('git', ['ls-files', '-s', '--', 'scripts/check-privacy.sh'], {
+        cwd: REPO_ROOT,
+        encoding: 'utf-8',
+      });
+      expect(indexed.status).toBe(0);
+      expect(indexed.stdout).toMatch(/^100755 /);
+      return;
+    }
     const stat = require('fs').statSync(PRIVACY_SCRIPT);
     // eslint-disable-next-line no-bitwise
     expect((stat.mode & 0o100) !== 0).toBe(true);

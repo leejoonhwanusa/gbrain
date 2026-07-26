@@ -68,31 +68,23 @@ describe("autopilot cycle-failure classification — only 'failed' trips the cir
   });
 });
 
-describe('runPhaseOrphans ratio threshold — no more absolute count > 20', () => {
+describe('runPhaseOrphans actionable-entity threshold — no inventory false positives', () => {
   test('the legacy `count > 20 ? "warn" : "ok"` ternary is gone', () => {
     // The literal that produced the steady-state warn-storm on any
     // brain past a few hundred pages.
     expect(cycleSource).not.toMatch(/count\s*>\s*20\s*\?\s*['"]warn['"]/);
   });
 
-  test('the new threshold is ratio-based against total_pages', () => {
-    // Must look at result.total_pages, not a magic absolute. The
-    // exact comparator (0.5 today) can move, but the *kind* of
-    // comparison must be a ratio so big brains don't always warn.
+  test('the threshold is ratio-based against active entity pages', () => {
     // Slice the runPhaseOrphans function body.
     const fnIdx = cycleSource.indexOf('async function runPhaseOrphans');
     expect(fnIdx).toBeGreaterThan(0);
     const fnEnd = cycleSource.indexOf('\n}', fnIdx);
     const fnBody = cycleSource.slice(fnIdx, fnEnd);
 
-    // Must reference total_pages in the threshold decision.
-    expect(fnBody).toMatch(/total_pages/);
-    // Must contain a division or multiplication against total_pages
-    // (ratio comparison). Accept either `count / result.total_pages` or
-    // `count > result.total_pages * X` framing.
-    expect(fnBody).toMatch(
-      /count\s*\/\s*result\.total_pages|result\.total_pages\s*\*/,
-    );
+    expect(fnBody).toMatch(/entityTotal/);
+    expect(fnBody).toMatch(/entityOrphans\s*\/\s*entityTotal/);
+    expect(fnBody).toContain("type IN ('entity', 'person', 'company', 'organization')");
   });
 
   test('the warn branch still exists (we narrowed, did not remove)', () => {

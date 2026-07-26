@@ -41,28 +41,24 @@ trap "rm -f \"$TMPOUT\"" EXIT
 
 GBRAIN_SKILLS_DIR="$ROOT/skills" bun run src/cli.ts doctor --fast --json >"$TMPOUT" 2>/dev/null || true
 
-# Extract the skill_brain_first check status. Use python3 (already a
-# repo-wide dependency via image-decoders + admin tooling) so we don't
-# add jq to the verify chain.
-STATUS=$(python3 -c "
-import json, sys
-with open('$TMPOUT') as fp:
-    for line in fp:
-        line = line.strip()
-        if not (line.startswith('{') and line.endswith('}')):
-            continue
-        try:
-            report = json.loads(line)
-        except Exception:
-            continue
-        for c in report.get('checks', []):
-            if c.get('name') == 'skill_brain_first':
-                print(c.get('status', 'missing'))
-                sys.exit(0)
-        print('missing')
-        sys.exit(0)
-print('parse_error')
-" 2>/dev/null || echo "parse_error")
+# Extract the skill_brain_first check status with Bun, which is already the
+# required project runtime. Reading stdin avoids translating Git Bash /tmp
+# paths for native Windows executables and avoids the Windows Store python3
+# alias, which can exist without a usable interpreter.
+STATUS=$(bun -e '
+const text = await Bun.stdin.text();
+for (const raw of text.split(/\r?\n/)) {
+  const line = raw.trim();
+  if (!(line.startsWith("{") && line.endsWith("}"))) continue;
+  try {
+    const report = JSON.parse(line);
+    const check = report.checks?.find((item) => item.name === "skill_brain_first");
+    console.log(check?.status ?? "missing");
+    process.exit(0);
+  } catch {}
+}
+console.log("parse_error");
+' <"$TMPOUT" 2>/dev/null || echo "parse_error")
 
 case "$STATUS" in
   ok)

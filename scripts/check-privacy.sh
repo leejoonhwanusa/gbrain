@@ -79,15 +79,12 @@ if ! command -v git >/dev/null 2>&1; then
   exit 2
 fi
 
-# Build the file list by scanning-mode.
+# Select the index for pre-commit mode; otherwise git grep reads tracked
+# working-tree files. One bulk scan is materially faster than spawning grep
+# three times for each of ~2,600 files on Windows.
+GREP_SCOPE=()
 if [ "$MODE" = staged ]; then
-  FILES=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)
-else
-  FILES=$(git ls-files 2>/dev/null || true)
-fi
-
-if [ -z "$FILES" ]; then
-  exit 0
+  GREP_SCOPE=(--cached)
 fi
 
 # Allow-list: files in which the banned name is legitimate.
@@ -180,32 +177,35 @@ is_allowed() {
   return 1
 }
 
-FOUND=0
-while IFS= read -r file; do
-  [ -z "$file" ] && continue
-  [ ! -f "$file" ] && continue
-  if is_allowed "$file"; then
-    continue
-  fi
-  # Case-insensitive grep; only specific extensions + known docs.
-  case "$file" in
-    *.md|*.ts|*.mjs|*.js|*.py|*.sh|*.json|*.yaml|*.yml|*.txt|README*|CHANGELOG*|CLAUDE*|AGENTS*)
-      if grep -in "$BANNED_NAME" "$file" >/dev/null 2>&1; then
-        echo "[check-privacy] BANNED NAME in $file:" >&2
-        grep -in "$BANNED_NAME" "$file" | sed 's|^|  |' >&2
-        FOUND=1
-      fi
-      # Banned wintermute-specific filesystem paths (codex T7).
-      for path in "${BANNED_PATHS[@]}"; do
-        if grep -nF "$path" "$file" >/dev/null 2>&1; then
-          echo "[check-privacy] BANNED PATH '$path' in $file:" >&2
-          grep -nF "$path" "$file" | sed 's|^|  |' >&2
-          FOUND=1
-        fi
-      done
-      ;;
+is_scanned_artifact() {
+  case "$1" in
+    *.md|*.ts|*.mjs|*.js|*.py|*.sh|*.json|*.yaml|*.yml|*.txt|README*|CHANGELOG*|CLAUDE*|AGENTS*) return 0 ;;
+    *) return 1 ;;
   esac
-done <<< "$FILES"
+}
+
+report_matches() {
+  local label="$1" needle="$2" matches="$3"
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    local file="${line%%:*}"
+    file="${file//\\//}"
+    is_scanned_artifact "$file" || continue
+    is_allowed "$file" && continue
+    echo "[check-privacy] $label '$needle' in $file:" >&2
+    echo "  $line" >&2
+    FOUND=1
+  done <<< "$matches"
+}
+
+FOUND=0
+NAME_MATCHES="$(git grep "${GREP_SCOPE[@]}" -niI -e "$BANNED_NAME" -- 2>/dev/null || true)"
+report_matches "BANNED NAME" "$BANNED_NAME" "$NAME_MATCHES"
+
+for path in "${BANNED_PATHS[@]}"; do
+  PATH_MATCHES="$(git grep "${GREP_SCOPE[@]}" -nIF -e "$path" -- 2>/dev/null || true)"
+  report_matches "BANNED PATH" "$path" "$PATH_MATCHES"
+done
 
 if [ "$FOUND" -eq 1 ]; then
   echo "" >&2

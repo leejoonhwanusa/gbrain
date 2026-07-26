@@ -1,8 +1,9 @@
 // src/core/onboard/checks.ts
 // sourcescope:file-brain-wide — every SQL site here is intentionally
-// brain-wide aggregate. The onboard checks REPORT across all sources
-// (orphan_count, stale_count, link_coverage, takes_count) so adding
-// source_id WHERE clauses would change the semantic. Per A26.
+// brain-wide aggregate. The onboard checks REPORT across all active sources
+// (orphan_count, stale_count, link_coverage, takes_count) so adding a single
+// source_id WHERE clause would change the semantic. Archived and explicitly
+// sync-disabled sources are operationally inactive and must not create work.
 //
 // v0.41.18.0 (A16, T4). Four new doctor checks consumed by both:
 //   - src/commands/doctor.ts runDoctor      (local surface)
@@ -56,7 +57,17 @@ export async function checkEmbedStaleness(
 ): Promise<OnboardCheckResult> {
   const staleCount = await safeCount(
     engine,
-    `SELECT COUNT(*) AS count FROM content_chunks WHERE embedding IS NULL`,
+    `SELECT COUNT(*) AS count
+       FROM content_chunks cc
+       JOIN pages p ON p.id = cc.page_id
+      WHERE cc.embedding IS NULL
+        AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
+        AND NOT EXISTS (
+          SELECT 1
+            FROM sources s
+           WHERE s.id = p.source_id
+             AND (s.archived IS TRUE OR (s.config ->> 'syncEnabled') = 'false')
+        )`,
   );
   const remediations: RemediationStep[] = [];
   let status: 'ok' | 'warn' | 'fail' = 'ok';
@@ -334,8 +345,8 @@ export async function checkTakesCount(
   if (takesCount >= 100) {
     message = `${takesCount} takes (calibration ready)`;
   } else if (takesCount === 0) {
-    status = 'warn';
     if (bootstrapEnabled) {
+      status = 'warn';
       message = `0 takes (bootstrap eligible — gbrain takes extract --from-pages)`;
       remediations.push(makeRemediationStep({
         id: 'onboard.takes_bootstrap',
@@ -349,7 +360,11 @@ export async function checkTakesCount(
         status: 'remediable',
       }));
     } else {
-      message = '0 takes (takes.bootstrap_enabled is false; opt in to enable)';
+      // Explicitly disabled means there is no accepted work to do. Keep the
+      // capability visible without treating consent-preserving opt-out as a
+      // health defect.
+      status = 'ok';
+      message = '0 takes (bootstrap intentionally disabled; informational)';
     }
   } else {
     message = `${takesCount} takes (calibration usable; >100 ideal)`;

@@ -126,7 +126,7 @@ describe('isPathContained', () => {
     const dir = scratch();
     const outside = scratch('pc-outside-');
     const link = join(dir, 'escape');
-    symlinkSync(outside, link);
+    symlinkSync(outside, link, 'junction');
     expect(isPathContained(link, dir)).toBe(false);
   });
   test('symlink resolving INSIDE the parent IS contained', () => {
@@ -134,7 +134,7 @@ describe('isPathContained', () => {
     const real = join(dir, 'real');
     mkdirSync(real);
     const link = join(dir, 'inlink');
-    symlinkSync(real, link);
+    symlinkSync(real, link, 'junction');
     expect(isPathContained(link, dir)).toBe(true);
   });
   test('missing path → not contained (fail-closed)', () => {
@@ -153,7 +153,7 @@ describe('realpathOrResolve', () => {
   test('resolves a symlink to its real target', () => {
     const dir = scratch();
     const real = join(dir, 'real'); mkdirSync(real);
-    const link = join(dir, 'link'); symlinkSync(real, link);
+    const link = join(dir, 'link'); symlinkSync(real, link, 'junction');
     expect(realpathOrResolve(link)).toBe(realpathOrResolve(real));
   });
   test('nonexistent path → lexical resolve (does not throw)', () => {
@@ -212,14 +212,14 @@ describe('isWriteTargetContained', () => {
     if (typeof process.getuid !== 'function') return;
     const root = scratch();
     const outside = scratch('wt-outside-');
-    symlinkSync(outside, join(root, 'link')); // root/link → outside
+    symlinkSync(outside, join(root, 'link'), 'junction'); // root/link → outside
     // target lands under the escaping symlink → real path is outside root
     expect(isWriteTargetContained(join(root, 'link', 'page.md'), root)).toBe(false);
   });
   test('a symlinked intermediate dir staying inside the root is allowed', () => {
     const root = scratch();
     mkdirSync(join(root, 'real'));
-    symlinkSync(join(root, 'real'), join(root, 'link'));
+    symlinkSync(join(root, 'real'), join(root, 'link'), 'junction');
     expect(isWriteTargetContained(join(root, 'link', 'page.md'), root)).toBe(true);
   });
 });
@@ -283,7 +283,7 @@ describe('autoDetectSkillsDir — skills/ symlink confinement', () => {
     if (typeof process.getuid !== 'function') return;
     const ws = scratch('ws-'); const outside = scratch('outside-');
     seedSkills(outside); // real skills with RESOLVER.md, OUTSIDE the workspace
-    symlinkSync(join(outside, 'skills'), join(ws, 'skills')); // ws/skills → outside/skills
+    symlinkSync(join(outside, 'skills'), join(ws, 'skills'), 'junction'); // ws/skills → outside/skills
     const found = autoDetectSkillsDir(scratch('cwd-'), { OPENCLAW_WORKSPACE: ws });
     expect(found.source).not.toBe('openclaw_workspace_env');
     expect(found.dir).not.toBe(join(ws, 'skills'));
@@ -293,7 +293,7 @@ describe('autoDetectSkillsDir — skills/ symlink confinement', () => {
     const ws = scratch('ws-');
     mkdirSync(join(ws, '_real'), { recursive: true });
     writeFileSync(join(ws, '_real', 'RESOLVER.md'), '# RESOLVER\n');
-    symlinkSync(join(ws, '_real'), join(ws, 'skills')); // contained symlink
+    symlinkSync(join(ws, '_real'), join(ws, 'skills'), 'junction'); // contained symlink
     const found = autoDetectSkillsDir(scratch('cwd-'), { OPENCLAW_WORKSPACE: ws });
     expect(found.source).toBe('openclaw_workspace_env');
     expect(found.dir).toBe(join(ws, 'skills'));
@@ -303,7 +303,7 @@ describe('autoDetectSkillsDir — skills/ symlink confinement', () => {
     if (typeof process.getuid !== 'function') return;
     const ws = scratch('ws-'); const outside = scratch('outside-');
     mkdirSync(join(outside, 'skills'), { recursive: true });
-    symlinkSync(join(outside, 'skills'), join(ws, 'skills'));
+    symlinkSync(join(outside, 'skills'), join(ws, 'skills'), 'junction');
     const found = autoDetectSkillsDir(ws, {});
     expect(found.dir).toBeNull();
   });
@@ -311,7 +311,7 @@ describe('autoDetectSkillsDir — skills/ symlink confinement', () => {
   test('cwd_walk_up: in-workspace skills symlink is allowed', () => {
     const ws = scratch('ws-');
     mkdirSync(join(ws, '_real'), { recursive: true });
-    symlinkSync(join(ws, '_real'), join(ws, 'skills'));
+    symlinkSync(join(ws, '_real'), join(ws, 'skills'), 'junction');
     const found = autoDetectSkillsDir(ws, {});
     expect(found.source).toBe('cwd_walk_up');
     expect(found.dir).toBe(join(ws, 'skills'));

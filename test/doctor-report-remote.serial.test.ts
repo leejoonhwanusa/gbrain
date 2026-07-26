@@ -82,6 +82,35 @@ describe('doctorReportRemote', () => {
     expect(report.status).toMatch(/healthy|warnings/);
     expect(report.health_score).toBeGreaterThanOrEqual(70);
   });
+
+  test('multi-source drift walk uses the bounded remote-doctor budget', async () => {
+    const sourceRoot = mkdtempSync(join(tmpdir(), 'gbrain-remote-drift-budget-'));
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config, archived)
+       VALUES ('remote-drift-budget', 'remote-drift-budget', $1, '{}'::jsonb, false)`,
+      [sourceRoot],
+    );
+
+    const realNow = Date.now;
+    let driftClockReads = 0;
+    Date.now = () => {
+      const stack = new Error().stack ?? '';
+      if (stack.includes('multi-source-drift.ts')) {
+        return 1_000 + driftClockReads++ * 3_000;
+      }
+      return realNow();
+    };
+    try {
+      const report = await doctorReportRemote(engine);
+      const drift = report.checks.find(c => c.name === 'multi_source_drift');
+      expect(drift?.status).toBe('warn');
+      expect(drift?.message).toContain('hit limit/timeout');
+    } finally {
+      Date.now = realNow;
+      await engine.executeRaw(`DELETE FROM sources WHERE id = 'remote-drift-budget'`);
+      rmSync(sourceRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('computeDoctorReport — score + status math', () => {

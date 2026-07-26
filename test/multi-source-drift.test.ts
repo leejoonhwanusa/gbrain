@@ -132,6 +132,54 @@ describe('findMisroutedPages — heuristic correctness', () => {
     expect(result.sample).toEqual([]);
   });
 
+  test('source-local .gbrainignore removes intentionally unsynced files from drift evidence', async () => {
+    const root = makeTmpRoot('gbrainignore');
+    seedFile(root, '.gbrainignore', '**/checkpoints/**\n');
+    seedFile(root, 'codex/checkpoints/operator-state.md');
+    await engine.putPage('codex/checkpoints/operator-state', {
+      type: 'note',
+      title: 'Operator state',
+      compiled_truth: '.',
+    });
+
+    const result = await findMisroutedPages(engine, [{ id: 'src-ignored', local_path: root }]);
+    expect(result.count).toBe(0);
+    expect(result.sample).toEqual([]);
+  });
+
+  test('ignored directory files do not consume the actionable file limit', async () => {
+    const root = makeTmpRoot('ignored-limit');
+    seedFile(root, '.gbrainignore', 'generated/\n');
+    for (let i = 0; i < 12; i++) {
+      seedFile(root, `generated/file-${i}.md`);
+    }
+    seedFile(root, 'topics/kept.md');
+
+    const result = await findMisroutedPages(
+      engine,
+      [{ id: 'src-ignored-limit', local_path: root }],
+      { limit: 5, timeoutMs: 5000 },
+    );
+    expect(result.walk_truncated).toBe(false);
+    expect(result.count).toBe(0);
+  });
+
+  test('canonical pruned dependency directories do not consume the file limit', async () => {
+    const root = makeTmpRoot('pruned-limit');
+    for (let i = 0; i < 12; i++) {
+      seedFile(root, `node_modules/pkg-${i}/readme.md`);
+    }
+    seedFile(root, 'topics/kept.md');
+
+    const result = await findMisroutedPages(
+      engine,
+      [{ id: 'src-pruned-limit', local_path: root }],
+      { limit: 5, timeoutMs: 5000 },
+    );
+    expect(result.walk_truncated).toBe(false);
+    expect(result.count).toBe(0);
+  });
+
   test('case 5: FS walk hits limit → walk_truncated=true', async () => {
     const root = makeTmpRoot('case5');
     // Seed 12 files with a limit of 5 to force truncation.
@@ -144,6 +192,25 @@ describe('findMisroutedPages — heuristic correctness', () => {
       timeoutMs: 5000,
     });
     expect(result.walk_truncated).toBe(true);
+  });
+
+  test('deadline stops a tree containing only non-markdown entries', async () => {
+    const root = makeTmpRoot('deadline-non-markdown');
+    seedFile(root, 'assets/ignored.txt');
+
+    const realNow = Date.now;
+    let clockReads = 0;
+    Date.now = () => 1_000 + (clockReads++ >= 2 ? 2 : 0);
+    try {
+      const result = await findMisroutedPages(
+        engine,
+        [{ id: 'src-deadline-fake', local_path: root }],
+        { timeoutMs: 1 },
+      );
+      expect(result.walk_truncated).toBe(true);
+    } finally {
+      Date.now = realNow;
+    }
   });
 
   test('case 6 (OV13): unreadable local_path does NOT crash; returns empty', async () => {

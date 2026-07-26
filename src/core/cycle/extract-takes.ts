@@ -203,6 +203,14 @@ export async function extractTakesFromDb(
     result.pagesScanned++;
     const page = await engine.getPage(slug, { sourceId: source_id });
     if (!page) continue;
+    // Code pages routinely contain fenced markdown examples and test fixture
+    // strings. Those are implementation text, not authored brain takes.
+    if (page.type === 'code') {
+      if (opts.rebuild && !dryRun) {
+        await engine.executeRaw(`DELETE FROM takes WHERE page_id = $1`, [page.id]);
+      }
+      continue;
+    }
     const body = `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`;
     const { takes, warnings } = parseTakesFence(body);
     if (warnings.length) {

@@ -16,7 +16,7 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { computeRemediationPlan } from '../../src/core/remediation/index.ts';
 import { captureMetric } from '../../src/core/onboard/impact-capture.ts';
 import { buildOnboardReport, toOnboardRecommendation } from '../../src/core/onboard/render.ts';
-import { runAllOnboardChecks } from '../../src/core/onboard/checks.ts';
+import { checkEmbedStaleness, runAllOnboardChecks } from '../../src/core/onboard/checks.ts';
 import { makeRemediationStep } from '../../src/core/remediation-step.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 
@@ -73,13 +73,47 @@ describe('onboard E2E — runAllOnboardChecks', () => {
     ]);
   });
 
-  test('empty brain: stale/link/timeline ok, takes_count warns (0 takes)', async () => {
+  test('empty brain: stale/link/timeline/takes_count are ok when bootstrap is disabled', async () => {
     const results = await runAllOnboardChecks(engine);
     const byName = Object.fromEntries(results.map((r) => [r.check.name, r.check.status]));
     expect(byName.embed_staleness).toBe('ok');
     expect(byName.entity_link_coverage).toBe('ok');
     expect(byName.timeline_coverage).toBe('ok');
-    expect(byName.takes_count).toBe('warn'); // 0 takes is a warn
+    expect(byName.takes_count).toBe('ok'); // explicit bootstrap opt-out is informational
+  });
+
+  test('embed staleness excludes archived and sync-disabled sources', async () => {
+    await resetPgliteState(engine);
+    try {
+      for (const [sourceId, config, archived] of [
+        ['active-source', '{}', false],
+        ['disabled-source', '{"syncEnabled":false}', false],
+        ['archived-source', '{}', true],
+      ] as const) {
+        await engine.executeRaw(
+          `INSERT INTO sources (id, name, local_path, config, archived, created_at)
+           VALUES ($1, $1, $2, $3::jsonb, $4, NOW())`,
+          [sourceId, `/fake/${sourceId}`, config, archived],
+        );
+        const rows = await engine.executeRaw<{ id: number }>(
+          `INSERT INTO pages (slug, source_id, title, type, compiled_truth, frontmatter, updated_at, created_at)
+           VALUES ('stale-page', $1, 'Stale page', 'note', 'body', '{}'::jsonb, NOW(), NOW())
+           RETURNING id`,
+          [sourceId],
+        );
+        await engine.executeRaw(
+          `INSERT INTO content_chunks (page_id, chunk_index, chunk_text, chunk_source)
+           VALUES ($1, 0, 'needs embedding', 'compiled_truth')`,
+          [rows[0]!.id],
+        );
+      }
+
+      const result = await checkEmbedStaleness(engine);
+      expect(result.check.status).toBe('warn');
+      expect(result.check.message).toBe('1 stale chunks (small backlog)');
+    } finally {
+      await resetPgliteState(engine);
+    }
   });
 
   test('test fixture entity pages do not lower link or timeline coverage', async () => {
@@ -111,8 +145,8 @@ describe('onboard E2E — runAllOnboardChecks', () => {
   test('empty brain remediations: takes_count gated, pack_upgrade_available may surface', async () => {
     const results = await runAllOnboardChecks(engine);
     const total = results.reduce((s, r) => s + r.remediations.length, 0);
-    // takes_count warns but does NOT emit a remediation (takes.bootstrap_enabled
-    // defaults to false — A12 two-gate consent).
+    // takes_count stays informational and emits no remediation
+    // (takes.bootstrap_enabled defaults to false — A12 two-gate consent).
     // v0.42 (T13): pack_upgrade_available CAN emit a manual_only remediation
     // when gbrain-base@1.x is active and gbrain-base-v2 is declared as the
     // successor (the unify-types Minion handler). Allow 0-1 remediations

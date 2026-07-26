@@ -52,6 +52,16 @@ import { isUndefinedColumnError } from '../core/utils.ts';
 import { resolveHardExcludes, DEFAULT_HARD_EXCLUDES } from '../core/search/source-boost.ts';
 import { escapeLikePattern, buildVisibilityClause } from '../core/search/sql-ranking.ts';
 
+// The built-in parser registry recognizes chat/transcript line formats, not
+// generic email documents. `email` is intentionally excluded: code repositories
+// commonly contain `/email/` skill and documentation paths that type inference
+// classifies as email even though their bodies are ordinary prose.
+export const CONVERSATION_FORMAT_COVERAGE_TYPES = [
+  'conversation',
+  'meeting',
+  'slack',
+] as const;
+
 export interface Check {
   name: string;
   status: 'ok' | 'warn' | 'fail';
@@ -236,6 +246,17 @@ function isGbrainSourceRoot(dir: string): boolean {
   );
 }
 
+function findGbrainSourceRoot(startDir: string): string | null {
+  let dir = startDir;
+  for (let i = 0; i < 10; i++) {
+    if (isGbrainSourceRoot(dir)) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
 export function resolveWhoknowsFixturePath(
   env: NodeJS.ProcessEnv = process.env,
   moduleUrl: string = import.meta.url,
@@ -246,14 +267,15 @@ export function resolveWhoknowsFixturePath(
       : resolvePath(process.cwd(), env.GBRAIN_WHOKNOWS_FIXTURE_PATH);
   }
 
+  // Compiled executables do not retain a useful file: URL for the source
+  // module. Prefer the current repository (or one of its parents) when the
+  // operator runs doctor from a GBrain checkout.
+  const cwdRoot = findGbrainSourceRoot(process.cwd());
+  if (cwdRoot) return join(cwdRoot, WHOKNOWS_FIXTURE_RELATIVE_PATH);
+
   try {
-    let dir = dirname(fileURLToPath(moduleUrl));
-    for (let i = 0; i < 10; i++) {
-      if (isGbrainSourceRoot(dir)) return join(dir, WHOKNOWS_FIXTURE_RELATIVE_PATH);
-      const parent = dirname(dir);
-      if (parent === dir) break;
-      dir = parent;
-    }
+    const moduleRoot = findGbrainSourceRoot(dirname(fileURLToPath(moduleUrl)));
+    if (moduleRoot) return join(moduleRoot, WHOKNOWS_FIXTURE_RELATIVE_PATH);
   } catch {
     // Some bundlers/runtimes may not expose a normal file: import URL.
     // Doctor should surface an override hint instead of fabricating a path.
@@ -662,6 +684,7 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
       const result = await findMisroutedPages(
         engine,
         nonDefaultWithPath.map(s => ({ id: s.id, local_path: s.local_path as string })),
+        { timeoutMs: 5_000 },
       );
       if (result.walk_truncated) {
         checks.push({
@@ -675,7 +698,7 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
           name: 'multi_source_drift',
           status: 'warn',
           message:
-            `${result.count} page slug(s) appear at 'default' but NOT at the intended source ` +
+            `${result.count} source/slug pair(s) appear at 'default' but NOT at the intended source ` +
             `(e.g., ${sampleStr}). Likely pre-v0.30.3 misroutes OR an incomplete initial sync. ` +
             `Verify on the brain host: \`gbrain sources status\` then \`gbrain sync --source <id> --full\`.`,
         });
@@ -3101,7 +3124,9 @@ export async function computeConversationFactsBacklogCheck(
  * thin-client doctorReportRemote path (CDX-5 trust boundary).
  *
  * `opts.sourceId` scopes both the denominator and the stale count to one
- * source (the explicit-only `--source` parse, like orphan_ratio).
+ * source (the explicit-only `--source` parse, like orphan_ratio). Archived
+ * and sync-disabled sources are excluded from both buckets because they are
+ * intentionally outside the actionable maintenance set.
  */
 export async function checkLinksExtractionLag(
   engine: BrainEngine,
@@ -3113,8 +3138,23 @@ export async function checkLinksExtractionLag(
   try {
     const totalRows = await engine.executeRaw<{ count: number }>(
       sourceId
-        ? `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL AND source_id = $1`
-        : `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL`,
+        ? `SELECT count(*)::int AS count
+             FROM pages p
+            WHERE p.deleted_at IS NULL
+               AND p.source_id = $1
+               AND NOT EXISTS (
+                 SELECT 1 FROM sources s
+                  WHERE s.id = p.source_id
+                    AND (s.archived IS TRUE OR (s.config ->> 'syncEnabled') = 'false')
+               )`
+        : `SELECT count(*)::int AS count
+             FROM pages p
+            WHERE p.deleted_at IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM sources s
+                  WHERE s.id = p.source_id
+                    AND (s.archived IS TRUE OR (s.config ->> 'syncEnabled') = 'false')
+               )`,
       sourceId ? [sourceId] : [],
     );
     const total = Number(totalRows[0]?.count ?? 0);
@@ -3127,7 +3167,12 @@ export async function checkLinksExtractionLag(
       return { name, status: 'ok', message: `Extraction lag not applicable (${total} pages — too few to assess)` };
     }
 
-    const stale = await engine.countStalePagesForExtraction({ sourceId, versionTs: LINK_EXTRACTOR_VERSION_TS });
+    const stale = await engine.countStalePagesForExtraction({
+      sourceId,
+      versionTs: LINK_EXTRACTOR_VERSION_TS,
+      excludeArchived: true,
+      excludeSyncDisabled: true,
+    });
     const pct = (stale / total) * 100;
     const pctStr = pct.toFixed(0);
     const scope = sourceId ? ` in source '${sourceId}'` : '';
@@ -3426,7 +3471,11 @@ export async function checkSyncFreshness(
     }>(
       // v0.41.32.0: newest_content_at feeds the REMOTE (non-localOnly) lag so
       // doctorReportRemote never shells out to git on a DB-supplied local_path.
-      `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL`,
+      `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at
+         FROM sources
+        WHERE local_path IS NOT NULL
+          AND archived IS NOT TRUE
+          AND (config ->> 'syncEnabled') IS DISTINCT FROM 'false'`,
     );
 
     if (sources.length === 0) {
@@ -3493,6 +3542,7 @@ export async function checkSyncFreshness(
     // bucket). Empty when nothing is syncing — keeps the steady-state messages
     // byte-for-byte unchanged.
     const inProgress: string[] = [];
+    const workingTreeDirty: string[] = [];
     let liveSyncSnap: (sourceId: string) => Promise<{ holder_pid: number; holder_host: string } | null> =
       async () => null;
     try {
@@ -3561,13 +3611,18 @@ export async function checkSyncFreshness(
       // The chunker version match is computed here (not in the helper)
       // because it depends on engine state, not git state.
       if (localOnly) {
-        const gitUnchanged = isSourceUnchangedSinceSync(
+        const commitUnchanged = isSourceUnchangedSinceSync(
+          source.local_path,
+          source.last_commit,
+        );
+        const workingTreeClean = isSourceUnchangedSinceSync(
           source.local_path,
           source.last_commit,
           { requireCleanWorkingTree: 'ignore-untracked' },
         );
         const chunkerMatch = source.chunker_version === currentChunkerVersion;
-        if (gitUnchanged && chunkerMatch) {
+        if (commitUnchanged && chunkerMatch) {
+          if (!workingTreeClean) workingTreeDirty.push(display);
           unchanged_count++;
           continue;
         }
@@ -3611,16 +3666,26 @@ export async function checkSyncFreshness(
     }
 
     // D6 invariant: every source incremented exactly one bucket.
-    const details = { unchanged_count, synced_recently_count, stale_count };
+    const details = workingTreeDirty.length > 0
+      ? {
+          unchanged_count,
+          synced_recently_count,
+          stale_count,
+          working_tree_dirty_count: workingTreeDirty.length,
+        }
+      : { unchanged_count, synced_recently_count, stale_count };
     // BUG 4: append in-progress context when any source is actively syncing.
     // Empty otherwise, so steady-state messages are byte-for-byte unchanged.
     const inProgressNote = inProgress.length ? `. ${inProgress.join('; ')}` : '';
+    const workingTreeNote = workingTreeDirty.length
+      ? `. ${workingTreeDirty.length} source(s) have tracked working-tree changes not indexed: ${workingTreeDirty.join(', ')}. Committed HEAD is current; commit and sync when the WIP is ready`
+      : '';
 
     if (hasFailures) {
       return {
         name: 'sync_freshness',
         status: 'fail',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` for each stale source${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` for each stale source${workingTreeNote}${inProgressNote}`,
         details,
       };
     }
@@ -3628,7 +3693,15 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'warn',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` to refresh${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` to refresh${workingTreeNote}${inProgressNote}`,
+        details,
+      };
+    }
+    if (workingTreeDirty.length > 0) {
+      return {
+        name: 'sync_freshness',
+        status: 'ok',
+        message: `${workingTreeDirty.length} source(s) have tracked working-tree WIP not indexed: ${workingTreeDirty.join(', ')}. Committed HEAD is current; this is informational until the WIP is committed${inProgressNote}`,
         details,
       };
     }
@@ -3780,14 +3853,13 @@ export async function checkPoolBudget(_engine: BrainEngine): Promise<Check> {
 }
 
 /**
- * v0.38 — per-source `last_full_cycle_at` freshness check.
+ * Per-source maintenance freshness check.
  *
- * Sibling to `sync_freshness`. Where sync_freshness reads `last_sync_at`
- * (one phase of the cycle), this check reads `sources.config->>'last_full_cycle_at'`
- * which is the canonical "this whole cycle completed" timestamp written
- * by runCycle's exit hook. Autopilot's per-source fan-out gate (the
- * v0.38 fan-out wave) reads the same field — so this check surfaces
- * exactly what autopilot sees when deciding to skip a source.
+ * Sibling to `sync_freshness`. It prefers
+ * `sources.config->>'last_source_cycle_at'`, the canonical per-source
+ * completion timestamp used by autopilot fan-out, and falls back to legacy
+ * `last_full_cycle_at` for pre-split rows. Brain-wide phases have their own
+ * `global_cycle_freshness` check.
  *
  * Default thresholds: warn at 6h, fail at 24h. Tighter than sync_freshness
  * because full-cycle staleness compounds (sync stale → extract stale →
@@ -3800,7 +3872,8 @@ export async function checkCycleFreshness(
   opts?: { nowMs?: number },
 ): Promise<Check> {
   try {
-    const sources = await engine.listAllSources({ localPathOnly: true });
+    const listedSources = await engine.listAllSources({ localPathOnly: true });
+    const sources = listedSources.filter((source) => source.config?.syncEnabled !== false);
     if (sources.length === 0) {
       return {
         name: 'cycle_freshness',
@@ -3823,21 +3896,23 @@ export async function checkCycleFreshness(
       const display = source.name && source.name !== source.id
         ? `'${source.id}' (${source.name})`
         : `'${source.id}'`;
-      const raw = source.config?.last_full_cycle_at;
+      const sourceRaw = source.config?.last_source_cycle_at;
+      const legacyRaw = source.config?.last_full_cycle_at;
+      const raw = typeof sourceRaw === 'string' ? sourceRaw : legacyRaw;
       if (typeof raw !== 'string') {
-        issues.push(`Source ${display} has never completed a full cycle`);
+        issues.push(`Source ${display} has never completed a source maintenance cycle`);
         hasFailures = true;
         continue;
       }
       const last = new Date(raw).getTime();
       if (!Number.isFinite(last)) {
-        issues.push(`Source ${display} has unparseable last_full_cycle_at: ${raw}`);
+        issues.push(`Source ${display} has unparseable source cycle timestamp: ${raw}`);
         hasWarnings = true;
         continue;
       }
       const ageMs = now - last;
       if (ageMs < 0) {
-        issues.push(`Source ${display} has future last_full_cycle_at — clock skew`);
+        issues.push(`Source ${display} has future source cycle timestamp — clock skew`);
         hasWarnings = true;
         continue;
       }
@@ -3855,7 +3930,7 @@ export async function checkCycleFreshness(
       return {
         name: 'cycle_freshness',
         status: 'fail',
-        message: `${issues.join('; ')}. Run \`gbrain dream --source <id>\` for each stale source, or start \`gbrain autopilot\`.`,
+        message: `${issues.join('; ')}. Run a source maintenance cycle for each stale source, or start \`gbrain autopilot\`.`,
       };
     }
     if (hasWarnings) {
@@ -3868,13 +3943,97 @@ export async function checkCycleFreshness(
     return {
       name: 'cycle_freshness',
       status: 'ok',
-      message: `All ${sources.length} federated source(s) cycled recently`,
+      message: `All ${sources.length} federated source(s) completed source maintenance recently`,
     };
   } catch (e) {
     return {
       name: 'cycle_freshness',
       status: 'warn',
       message: `Could not check cycle freshness: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+}
+
+/** Actionable doctor backlog excludes code blobs and pages already accepted as non-embeddable. */
+export function isActionableOversizedPage(row: {
+  type: string;
+  frontmatter: Record<string, unknown> | null;
+}): boolean {
+  if (row.type === 'code') return false;
+  const raw = row.frontmatter?.embed_skip;
+  if (raw === true) return false;
+  if (typeof raw === 'string' && ['true', '1', 'yes', 'on'].includes(raw.trim().toLowerCase())) return false;
+  const flag = row.frontmatter?.content_flag;
+  if (flag && typeof flag === 'object' && (flag as Record<string, unknown>).reason === 'oversized') return false;
+  return true;
+}
+
+/** Code frequently contains junk-pattern literals as examples; it is not scraped prose. */
+export function shouldAssessDoctorJunkPage(type: string): boolean {
+  return type !== 'code';
+}
+
+/** Brain-wide maintenance freshness, independent of per-source cycles. */
+export async function checkGlobalCycleFreshness(
+  engine: BrainEngine,
+  opts?: { nowMs?: number },
+): Promise<Check> {
+  try {
+    const raw = await engine.getConfig('autopilot.last_global_at');
+    if (!raw) {
+      return {
+        name: 'global_cycle_freshness',
+        status: 'fail',
+        message: 'Brain-wide maintenance has never completed. Run one autopilot-global-maintenance pass or start `gbrain autopilot`.',
+      };
+    }
+
+    const last = new Date(raw).getTime();
+    if (!Number.isFinite(last)) {
+      return {
+        name: 'global_cycle_freshness',
+        status: 'warn',
+        message: `Brain-wide maintenance timestamp is unparseable: ${raw}`,
+      };
+    }
+
+    const now = opts?.nowMs ?? Date.now();
+    const ageMs = now - last;
+    if (ageMs < 0) {
+      return {
+        name: 'global_cycle_freshness',
+        status: 'warn',
+        message: 'Brain-wide maintenance timestamp is in the future — clock skew',
+      };
+    }
+
+    const warnHours = _resolveSyncFreshnessHours('GBRAIN_GLOBAL_CYCLE_FRESHNESS_WARN_HOURS', 6);
+    const failHours = _resolveSyncFreshnessHours('GBRAIN_GLOBAL_CYCLE_FRESHNESS_FAIL_HOURS', 24);
+    const ageHours = Math.floor(ageMs / (60 * 60 * 1000));
+    if (ageMs > failHours * 60 * 60 * 1000) {
+      return {
+        name: 'global_cycle_freshness',
+        status: 'fail',
+        message: `Brain-wide maintenance last completed ${ageHours}h ago. Run one autopilot-global-maintenance pass or start \`gbrain autopilot\`.`,
+      };
+    }
+    if (ageMs > warnHours * 60 * 60 * 1000) {
+      return {
+        name: 'global_cycle_freshness',
+        status: 'warn',
+        message: `Brain-wide maintenance last completed ${ageHours}h ago.`,
+      };
+    }
+    return {
+      name: 'global_cycle_freshness',
+      status: 'ok',
+      message: `Brain-wide maintenance completed ${ageHours}h ago`,
+    };
+  } catch (e) {
+    return {
+      name: 'global_cycle_freshness',
+      status: 'warn',
+      message: `Could not check global cycle freshness: ${e instanceof Error ? e.message : String(e)}`,
     };
   }
 }
@@ -4166,6 +4325,15 @@ export function buildRetrievalReflexCheck(skillsDir: string | null): Check {
   } catch (e) {
     return { name, status: 'warn', message: `could not check: ${(e as Error).message}` };
   }
+}
+
+/** Return the audit slice belonging to the currently-running supervisor. */
+export function currentSupervisorRunEvents<T extends { event: string; ts: string }>(events: T[]): T[] {
+  let latestStart = -1;
+  for (let i = 0; i < events.length; i++) {
+    if (events[i].event === 'started') latestStart = i;
+  }
+  return latestStart >= 0 ? events.slice(latestStart) : events;
 }
 
 export async function buildChecks(
@@ -4461,10 +4629,12 @@ export async function buildChecks(
     // (runtime) without grep'ing JSONL. `classifyWorkerExit` is still
     // used by the supervisor's internal restart policy where the binary
     // shape is the right contract.
-    const summary = summarizeCrashes(events);
+    const historicalSummary = summarizeCrashes(events);
+    const currentRunEvents = currentSupervisorRunEvents(events);
+    const summary = summarizeCrashes(currentRunEvents);
     const crashes24h = summary.total;
     const causeStr = `runtime=${summary.by_cause.runtime_error} oom=${summary.by_cause.oom_or_external_kill} rss=${summary.by_cause.rss_watchdog} unknown=${summary.by_cause.unknown} legacy=${summary.by_cause.legacy}${summary.by_cause.rss_watchdog > 0 ? ' (see worker_oom_loop)' : ''}`;
-    const maxCrashesEvent = events.filter(e => e.event === 'max_crashes_exceeded').pop() ?? null;
+    const maxCrashesEvent = currentRunEvents.filter(e => e.event === 'max_crashes_exceeded').pop() ?? null;
 
     // Only surface a Check if the supervisor was ever observed (stops the
     // "never used the supervisor" install from getting a warn about it).
@@ -4488,13 +4658,13 @@ export async function buildChecks(
         checks.push({
           name: 'supervisor',
           status: 'warn',
-          message: `Worker crashed ${crashes24h}x in last 24h (${causeStr}). Check ~/.gbrain/audit/supervisor-*.jsonl for context.`,
+          message: `Worker crashed ${crashes24h}x in the current supervisor run (${causeStr}; historical_crashes_24h=${historicalSummary.total}). Check ~/.gbrain/audit/supervisor-*.jsonl for context.`,
         });
       } else {
         checks.push({
           name: 'supervisor',
           status: 'ok',
-          message: `running=true${detectedViaDbLock ? ' (detected via DB lock; pidfile not at the HOME-derived path)' : ` pid=${supervisorPid}`} last_start=${lastStart ?? 'unknown'} crashes_24h=${crashes24h} clean_exits_24h=${summary.clean_exits}`,
+          message: `running=true${detectedViaDbLock ? ' (detected via DB lock; pidfile not at the HOME-derived path)' : ` pid=${supervisorPid}`} last_start=${lastStart ?? 'unknown'} current_run_crashes=${crashes24h} historical_crashes_24h=${historicalSummary.total} clean_exits_24h=${historicalSummary.clean_exits}`,
         });
       }
     }
@@ -4872,11 +5042,10 @@ export async function buildChecks(
   if (engine) {
     try {
       const { parseConversation } = await import('../core/conversation-parser/parse.ts');
-      const allowedTypes = ['conversation', 'meeting', 'slack', 'email'] as const;
-      // PageFilters supports singular `type` only; iterate the 4 types
-      // and cap at ~50/each to land at ~200 total max.
+      // PageFilters supports singular `type` only; iterate the 3 transcript
+      // types and cap at ~50/each to land at ~150 total max.
       const sample: import('../core/types.ts').Page[] = [];
-      for (const t of allowedTypes) {
+      for (const t of CONVERSATION_FORMAT_COVERAGE_TYPES) {
         const slice = await engine.listPages({ limit: 50, type: t as import('../core/types.ts').PageType });
         sample.push(...slice);
       }
@@ -5062,13 +5231,20 @@ export async function buildChecks(
   if (engine !== null) try {
     const { findMisroutedPages } = await import('../core/multi-source-drift.ts');
     const sources = await engine!.executeRaw<{ id: string; local_path: string | null }>(
-      `SELECT id, local_path FROM sources`,
+      `SELECT id, local_path
+         FROM sources
+        WHERE archived IS NOT TRUE
+          AND (config ->> 'syncEnabled') IS DISTINCT FROM 'false'`,
     );
     const nonDefaultWithPath = sources.filter(s => s.id !== 'default' && s.local_path);
     if (sources.length > 1 && nonDefaultWithPath.length > 0) {
       const result = await findMisroutedPages(
         engine!,
         nonDefaultWithPath.map(s => ({ id: s.id, local_path: s.local_path as string })),
+        {
+          limit: Math.max(1, Math.floor(_resolveEnvNumber('GBRAIN_DRIFT_LIMIT', 10_000))),
+          timeoutMs: Math.max(1, Math.floor(_resolveEnvNumber('GBRAIN_DRIFT_TIMEOUT_MS', 15_000, { unit: 'ms' }))),
+        },
       );
       if (result.walk_truncated) {
         checks.push({
@@ -5084,7 +5260,7 @@ export async function buildChecks(
           name: 'multi_source_drift',
           status: 'warn',
           message:
-            `${result.count} page slug(s) appear at 'default' but NOT at the intended source ` +
+            `${result.count} source/slug pair(s) appear at 'default' but NOT at the intended source ` +
             `(e.g., ${sampleStr}). Two possible causes: (1) pre-v0.30.3 putPage misroutes; ` +
             `(2) source X never completed initial sync and the default page is unrelated. ` +
             `Verify with 'gbrain sources status', then either re-sync with ` +
@@ -6249,10 +6425,16 @@ export async function buildChecks(
     const _cfg = _loadCfg();
     const bytesBlock = _cfg?.content_sanity?.bytes_block ?? 500_000;
     const rows = await sql`
-      SELECT p.slug, p.source_id,
+      SELECT p.slug, p.source_id, p.type, p.frontmatter,
              octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) AS bytes
       FROM pages p
       WHERE p.deleted_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sources s
+          WHERE s.id = p.source_id
+            AND (s.archived IS TRUE OR (s.config ->> 'syncEnabled') = 'false')
+        )
         AND (octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, ''))) > ${bytesBlock}
       ORDER BY bytes DESC
       LIMIT 100
@@ -6264,14 +6446,28 @@ export async function buildChecks(
         message: `No pages exceed ${bytesBlock} bytes`,
       });
     } else {
-      const oversizeRows = rows as unknown as Array<{ slug: string; source_id: string; bytes: number }>;
-      const top = oversizeRows.slice(0, 3)
+      const oversizeRows = rows as unknown as Array<{
+        slug: string;
+        source_id: string;
+        type: string;
+        frontmatter: Record<string, unknown> | null;
+        bytes: number;
+      }>;
+      const actionableRows = oversizeRows.filter(isActionableOversizedPage);
+      const acceptedCount = oversizeRows.length - actionableRows.length;
+      const top = actionableRows.slice(0, 3)
         .map(r => `${r.slug} (${r.bytes}b, src=${r.source_id})`)
         .join('; ');
       checks.push({
         name: 'oversized_pages',
-        status: 'warn',
-        message: `${rows.length} page(s) exceed ${bytesBlock}-byte block threshold. Top: ${top}. New ingests with the same shape get frontmatter.embed_skip set automatically; existing oversized pages can be split or accepted as non-embeddable.`,
+        status: actionableRows.length > 0 ? 'warn' : 'ok',
+        message: actionableRows.length > 0
+          ? `${actionableRows.length} untreated non-code page(s) exceed ${bytesBlock}-byte block threshold. Top: ${top}. ${acceptedCount} code or embed-skipped page(s) are accepted inventory.`
+          : `No untreated non-code pages exceed ${bytesBlock} bytes (${acceptedCount} code or embed-skipped page(s) accepted)`,
+        details: {
+          actionable_count: actionableRows.length,
+          accepted_count: acceptedCount,
+        },
       });
     }
   } catch (err) {
@@ -6292,26 +6488,39 @@ export async function buildChecks(
     const scanLimit = fullContentAudit ? null : 1000;
     const rows = scanLimit
       ? await sql`
-          SELECT p.slug, p.source_id, p.title,
+          SELECT p.slug, p.source_id, p.type, p.title,
                  LEFT(p.compiled_truth, 2048) AS body_head,
                  LEFT(COALESCE(p.timeline, ''), 1024) AS tl_head,
                  p.frontmatter
             FROM pages p
            WHERE p.deleted_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1
+               FROM sources s
+               WHERE s.id = p.source_id
+                 AND (s.archived IS TRUE OR (s.config ->> 'syncEnabled') = 'false')
+             )
            ORDER BY p.updated_at DESC
            LIMIT ${scanLimit}
         `
       : await sql`
-          SELECT p.slug, p.source_id, p.title,
+          SELECT p.slug, p.source_id, p.type, p.title,
                  LEFT(p.compiled_truth, 2048) AS body_head,
                  LEFT(COALESCE(p.timeline, ''), 1024) AS tl_head,
                  p.frontmatter
             FROM pages p
            WHERE p.deleted_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1
+               FROM sources s
+               WHERE s.id = p.source_id
+                 AND (s.archived IS TRUE OR (s.config ->> 'syncEnabled') = 'false')
+             )
         `;
     const hits: Array<{ slug: string; matched: string[] }> = [];
-    const scanRows = rows as unknown as Array<{ slug: string; source_id: string; title: string; body_head: string; tl_head: string; frontmatter: Record<string, unknown> | null }>;
+    const scanRows = rows as unknown as Array<{ slug: string; source_id: string; type: string; title: string; body_head: string; tl_head: string; frontmatter: Record<string, unknown> | null }>;
     for (const r of scanRows) {
+      if (!shouldAssessDoctorJunkPage(r.type)) continue;
       const sanity = assessContentSanity({
         compiled_truth: r.body_head ?? '',
         timeline: r.tl_head ?? '',
@@ -6356,7 +6565,21 @@ export async function buildChecks(
   try {
     const { readRecentContentSanityEvents, summarizeContentSanityEvents } =
       await import('../core/audit/content-sanity-audit.ts');
-    const events = readRecentContentSanityEvents(7);
+    const allEvents = readRecentContentSanityEvents(7);
+    // Audit JSONL is historical. Do not let archived/disabled sources keep
+    // today's doctor yellow after an operator deliberately removed them from
+    // active maintenance (for example an offline host). Unknown-source rows
+    // remain visible because they cannot be safely classified as inactive.
+    const activeSourceRows = await engine.executeRaw<{ id: string }>(
+      `SELECT id FROM sources
+        WHERE archived IS NOT TRUE
+          AND (config ->> 'syncEnabled') IS DISTINCT FROM 'false'`,
+    );
+    const activeSourceIds = new Set(activeSourceRows.map((row) => row.id));
+    const events = allEvents.filter((event) =>
+      event.source_id === '' || activeSourceIds.has(event.source_id),
+    );
+    const inactiveEventsExcluded = allEvents.length - events.length;
     if (events.length === 0) {
       checks.push({
         name: 'content_sanity_audit_recent',
@@ -6387,13 +6610,15 @@ export async function buildChecks(
       const hardBlocked =
         summary.by_type.hard_block + summary.by_type.reject + summary.by_type.quarantine;
       const softBlocked = summary.by_type.soft_block + summary.by_type.flag;
-      const status: 'ok' | 'warn' | 'fail' =
-        hardBlocked > 0 ? 'fail' :
-          (softBlocked > 0 || events.length >= 10) ? 'warn' : 'ok';
+      // Soft/flag/warn rows are telemetry for content that remains reviewable;
+      // quarantined/rejected content is the actual health failure. Flag counts
+      // stay visible in the dedicated flagged_pages check without double-
+      // penalizing the same reviewed inventory here.
+      const status: 'ok' | 'fail' = hardBlocked > 0 ? 'fail' : 'ok';
       checks.push({
         name: 'content_sanity_audit_recent',
         status,
-        message: `${events.length} events (hard=${hardBlocked} [hard_block=${summary.by_type.hard_block} reject=${summary.by_type.reject} quarantine=${summary.by_type.quarantine}] soft=${softBlocked} [soft_block=${summary.by_type.soft_block} flag=${summary.by_type.flag}] warn=${summary.by_type.warn})${topPatterns ? ', patterns: ' + topPatterns : ''}${topSources ? ', sources: ' + topSources : ''}. (Local audit only — multi-host operators set GBRAIN_AUDIT_DIR.)`,
+        message: `${events.length} active-source events (hard=${hardBlocked} [hard_block=${summary.by_type.hard_block} reject=${summary.by_type.reject} quarantine=${summary.by_type.quarantine}] soft=${softBlocked} [soft_block=${summary.by_type.soft_block} flag=${summary.by_type.flag}] warn=${summary.by_type.warn})${inactiveEventsExcluded > 0 ? `; ${inactiveEventsExcluded} inactive-source event(s) excluded` : ''}${topPatterns ? ', patterns: ' + topPatterns : ''}${topSources ? ', sources: ' + topSources : ''}. (Soft/flag/warn rows are informational; local audit only — multi-host operators set GBRAIN_AUDIT_DIR.)`,
       });
     }
   } catch (err) {
@@ -6414,7 +6639,15 @@ export async function buildChecks(
     // dead on the default PGLite engine). The JSONB `?` existence operator is
     // literal SQL through executeRaw on both engines.
     const rows = await engine.executeRaw<{ n: string | number }>(
-      `SELECT COUNT(*)::int AS n FROM pages p WHERE p.deleted_at IS NULL AND p.frontmatter ? 'quarantine'`,
+      `SELECT COUNT(*)::int AS n
+         FROM pages p
+        WHERE p.deleted_at IS NULL
+          AND p.frontmatter ? 'quarantine'
+          AND NOT EXISTS (
+            SELECT 1 FROM sources s
+             WHERE s.id = p.source_id
+               AND (s.archived IS TRUE OR (s.config ->> 'syncEnabled') = 'false')
+          )`,
     );
     const n = Number(rows[0]?.n ?? 0);
     checks.push({
@@ -6432,16 +6665,25 @@ export async function buildChecks(
   progress.heartbeat('flagged_pages');
   try {
     const rows = await engine.executeRaw<{ n: string | number }>(
-      `SELECT COUNT(*)::int AS n FROM pages p WHERE p.deleted_at IS NULL AND p.frontmatter ? 'content_flag'`,
+      `SELECT COUNT(*)::int AS n
+         FROM pages p
+        WHERE p.deleted_at IS NULL
+          AND p.frontmatter ? 'content_flag'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sources s
+            WHERE s.id = p.source_id
+              AND (s.archived IS TRUE OR (s.config ->> 'syncEnabled') = 'false')
+          )`,
     );
     const n = Number(rows[0]?.n ?? 0);
-    // Flagged pages are "examine me", not "broken" — warn so they're visible
-    // but the message is non-alarming.
+    // Flagged pages are "examine me", not "broken". Keep their count visible
+    // without lowering health; hidden/quarantined content has its own warning.
     checks.push({
       name: 'flagged_pages',
-      status: n > 0 ? 'warn' : 'ok',
+      status: 'ok',
       message: n > 0
-        ? `${n} page(s) flagged (markup-heavy or oversize) — still searchable, agent warned on retrieval. Review with 'gbrain quarantine list --include-flagged'.`
+        ? `${n} page(s) flagged for review (markup-heavy or oversize) — informational, still searchable. Review with 'gbrain quarantine list --include-flagged'.`
         : 'No flagged pages',
     });
   } catch (err) {
@@ -6504,6 +6746,7 @@ export async function buildChecks(
     const report = await scanBrainSources(engine, {
       signal: fmAbort,
       deadline: fmDeadline,
+      activeOnly: true,
       dbPageCountForSource,
     });
 
@@ -6813,28 +7056,36 @@ export async function buildChecks(
   // frontmatter JSONB and is the slow path.
   progress.heartbeat('effective_date_health');
   try {
-    const result = await engine.executeRaw<{ kind: string; count: string }>(
-      `WITH sample AS (
-         SELECT slug, frontmatter, effective_date, effective_date_source
-           FROM pages
-          ORDER BY id DESC
-          LIMIT 1000
-       )
-       SELECT 'fallback_with_fm_date' AS kind, COUNT(*)::text AS count
-         FROM sample
-        WHERE effective_date_source = 'fallback'
-          AND (frontmatter ? 'event_date' OR frontmatter ? 'date' OR frontmatter ? 'published')
-       UNION ALL
-       SELECT 'future_dated', COUNT(*)::text FROM sample
-        WHERE effective_date IS NOT NULL AND effective_date > NOW() + INTERVAL '1 year'
-       UNION ALL
-       SELECT 'pre_1990', COUNT(*)::text FROM sample
-        WHERE effective_date IS NOT NULL AND effective_date < TIMESTAMPTZ '1990-01-01'`,
+    const sample = await engine.executeRaw<{
+      frontmatter: Record<string, unknown> | null;
+      effective_date: Date | string | null;
+      effective_date_source: string | null;
+    }>(
+      `SELECT frontmatter, effective_date, effective_date_source
+         FROM pages
+        ORDER BY id DESC
+        LIMIT 1000`,
     );
-    const counts = new Map(result.map(r => [r.kind, Number(r.count)]));
-    const fallbackWithFm = counts.get('fallback_with_fm_date') ?? 0;
-    const future = counts.get('future_dated') ?? 0;
-    const pre1990 = counts.get('pre_1990') ?? 0;
+    const { parseEffectiveDateCandidate } = await import('../core/effective-date.ts');
+    const fallbackWithFm = sample.filter((row) => {
+      if (row.effective_date_source !== 'fallback') return false;
+      const fm = row.frontmatter ?? {};
+      return ['event_date', 'date', 'published']
+        .some((key) => parseEffectiveDateCandidate(fm[key]) !== null);
+    }).length;
+    const now = Date.now();
+    const oneYearMs = 365 * 24 * 60 * 60 * 1000;
+    const minMs = Date.UTC(1990, 0, 1);
+    const future = sample.filter((row) => {
+      if (row.effective_date == null) return false;
+      const ms = new Date(row.effective_date).getTime();
+      return Number.isFinite(ms) && ms > now + oneYearMs;
+    }).length;
+    const pre1990 = sample.filter((row) => {
+      if (row.effective_date == null) return false;
+      const ms = new Date(row.effective_date).getTime();
+      return Number.isFinite(ms) && ms < minMs;
+    }).length;
     if (fallbackWithFm > 0 || future > 0 || pre1990 > 0) {
       const parts: string[] = [];
       if (fallbackWithFm > 0) parts.push(`${fallbackWithFm} fell back to updated_at despite parseable frontmatter date`);
@@ -6874,8 +7125,12 @@ export async function buildChecks(
          FROM pages p
          JOIN takes t ON t.page_id = p.id AND t.active = TRUE
         WHERE COALESCE(p.emotional_weight, 0) = 0
+          AND p.type <> 'code'
        UNION ALL
-       SELECT 'nonzero_weight', COUNT(*)::text FROM pages WHERE COALESCE(emotional_weight, 0) > 0`,
+       SELECT 'nonzero_weight', COUNT(*)::text
+         FROM pages
+        WHERE COALESCE(emotional_weight, 0) > 0
+          AND type <> 'code'`,
     );
     const counts = new Map(result.map(r => [r.kind, Number(r.n)]));
     const zeroWithTakes = counts.get('zero_weight_with_takes') ?? 0;
@@ -7241,11 +7496,12 @@ export async function buildChecks(
     // parse, like orphan_ratio); bare doctor stays brain-wide. Fix: extract --stale.
     progress.heartbeat('links_extraction_lag');
     checks.push(await checkLinksExtractionLag(engine, { sourceId: orphanRatioSourceId }));
-    // v0.38 — full-cycle freshness, sibling to sync_freshness. Reads
-    // last_full_cycle_at from sources.config; mirrors what autopilot's
-    // per-source dispatch gate sees.
+    // Per-source maintenance freshness, sibling to sync_freshness. Prefers
+    // last_source_cycle_at with a legacy last_full_cycle_at fallback.
     progress.heartbeat('cycle_freshness');
     checks.push(await checkCycleFreshness(engine));
+    progress.heartbeat('global_cycle_freshness');
+    checks.push(await checkGlobalCycleFreshness(engine));
   }
 
   // v0.32.3 search-lite — mode + eval_drift surfaces. Status stays 'ok' per

@@ -1405,19 +1405,20 @@ export interface BrainHealth {
   embed_coverage: number;
   stale_pages: number;
   /**
-   * Islanded pages — zero inbound AND zero outbound links. A hub page
+   * Islanded active entity-like pages — zero inbound AND zero outbound links. A hub page
    * that has references out but no back-references is NOT an orphan under
    * this definition (it's working as intended as an index). The metric
    * aims at "pages I forgot to connect to anything", not the stricter
-   * graph-theory "no inbound" definition. Both engines share this
-   * semantics after Bug 11 doc-drift fix.
+   * graph-theory "no inbound" definition. Code, document inventory, archived
+   * sources, and sync-disabled sources are excluded from graph-quality debt.
    */
   orphan_pages: number;
   missing_embeddings: number;
   /**
    * Composite quality score, 0-100. Weighted sum of five components: embed
-   * coverage, link density, timeline coverage, orphan avoidance, dead-link
-   * avoidance. See the per-component *_score fields below for breakdown.
+   * coverage across active chunks, entity graph connection/timeline coverage,
+   * entity orphan avoidance, and dead-link avoidance. See the per-component
+   * *_score fields below for breakdown.
    */
   brain_score: number;
   /**
@@ -1426,9 +1427,9 @@ export interface BrainHealth {
    * DELETEs can produce dangling references.
    */
   dead_links: number;
-  /** Fraction of entity pages (person/company) with >= 1 inbound link. */
+  /** Fraction of active entity pages with >= 1 inbound link. */
   link_coverage: number;
-  /** Fraction of entity pages (person/company) with >= 1 structured timeline entry. */
+  /** Fraction of active entity pages with >= 1 structured timeline entry. */
   timeline_coverage: number;
   /** Top 5 entities by total link count (in + out). */
   most_connected: Array<{ slug: string; link_count: number }>;
@@ -1437,7 +1438,7 @@ export interface BrainHealth {
    * construction. Displayed by `gbrain doctor` when brain_score < 100.
    * Field names are distinct from the entity-scoped link_coverage /
    * timeline_coverage above to avoid semantic collision (these reflect
-   * whole-brain measures used in the score formula).
+   * entity-graph measures used in the score formula).
    */
   embed_coverage_score: number;     // 0-35
   link_density_score: number;        // 0-25

@@ -1358,25 +1358,45 @@ async function runPhaseOrphans(engine: BrainEngine): Promise<PhaseResult> {
     const { findOrphans } = await import('../commands/orphans.ts');
     const result = await findOrphans(engine);
     const count = result.total_orphans;
-    // Orphans are a code-smell signal, not a fatal condition. The
-    // original `count > 20` cutoff was tuned for small dev brains; on
-    // any corpus past a few hundred pages it fires 'warn' every cycle
-    // in steady state. Combined with the autopilot circuit-breaker
-    // historically tripping on cycle.status='partial', that produced
-    // respawn storms under KeepAlive=true. Switch to a ratio: warn
-    // only when more than half the corpus is orphaned (the real "your
-    // graph fell apart" signal). total_pages=0 is a defensive 'ok'.
+    // Code/document inventory does not require wiki-link connectivity. Use
+    // the same entity-like active-page universe as brain_score/doctor when
+    // deciding whether this diagnostic should make the cycle partial.
+    const entityStats = (await engine.executeRaw<{ total: number; orphaned: number }>(
+      `WITH eligible AS (
+         SELECT p.id FROM pages p
+          WHERE p.deleted_at IS NULL
+            AND p.type IN ('entity', 'person', 'company', 'organization')
+            AND NOT EXISTS (
+              SELECT 1 FROM sources s
+               WHERE s.id = p.source_id
+                 AND (s.archived IS TRUE OR (s.config ->> 'syncEnabled') = 'false')
+            )
+       )
+       SELECT
+         (SELECT count(*)::int FROM eligible) AS total,
+         (SELECT count(*)::int FROM eligible p
+           WHERE NOT EXISTS (
+             SELECT 1 FROM links l
+              WHERE l.to_page_id = p.id OR l.from_page_id = p.id
+           )) AS orphaned`,
+    ))[0] ?? { total: 0, orphaned: 0 };
+    const entityTotal = Number(entityStats.total ?? 0);
+    const entityOrphans = Number(entityStats.orphaned ?? 0);
+    // Small entity sets are not statistically actionable; doctor uses the
+    // same <100 vacuity gate for orphan_ratio.
     const status: PhaseStatus =
-      result.total_pages > 0 && count / result.total_pages > 0.5 ? 'warn' : 'ok';
+      entityTotal >= 100 && entityOrphans / entityTotal > 0.5 ? 'warn' : 'ok';
     return {
       phase: 'orphans',
       status,
       duration_ms: 0,
-      summary: `${count} orphan page(s) out of ${result.total_pages} total`,
+      summary: `${count} inventory orphan(s) out of ${result.total_pages} total; actionable entities ${entityOrphans}/${entityTotal}`,
       details: {
         total_orphans: count,
         total_pages: result.total_pages,
         excluded: result.excluded,
+        actionable_entity_orphans: entityOrphans,
+        actionable_entity_total: entityTotal,
       },
     };
   } catch (e) {
@@ -1434,7 +1454,7 @@ export async function runCycle(
   // (opts.sourceId) wins; else derive from the resolved checkout dir. Without
   // this, `gbrain dream --source repo-a` on a checkout-less brain would scope
   // those phases to 'default' (resolveSourceForDir(null) → undefined) while the
-  // cycle still locks + stamps last_full_cycle_at for repo-a — a freshness
+  // cycle still locks + stamps last_source_cycle_at for repo-a — a freshness
   // stamp that lies. resolveSourceForDir returns undefined when brainDir is
   // null, so opts.sourceId is the only signal in the no-checkout case.
   const cycleSourceId: string | undefined = engine
@@ -2286,8 +2306,8 @@ export async function runCycle(
   // #1972 (Codex #9): a phase that breaks on abort returns status 'ok' with
   // partial counts. If the abort fired during the LAST selected phase, no
   // between-phase checkAborted ran afterward, so without this guard runCycle
-  // would compute an ok/partial status AND stamp last_full_cycle_at — marking
-  // a cancelled run as a completed full cycle, which makes the next tick skip
+  // would compute an ok/partial status AND stamp source freshness — marking
+  // a cancelled run as completed, which makes the next tick skip
   // work it never actually did. Treat an aborted signal as a non-success run:
   // skip the freshness stamp and report status 'partial' with reason 'aborted'.
   const aborted = opts.signal?.aborted === true;
@@ -2311,9 +2331,11 @@ export async function runCycle(
     }
   }
 
-  // v0.38 (codex r1 P0-5): persist per-source cycle completion timestamp
-  // when the cycle ran successfully against an explicit source. Read by
-  // autopilot's per-source freshness gate next tick. Skipped when:
+  // Persist per-source maintenance completion when a cycle succeeds against
+  // an explicit source. Partial phase selections update only
+  // last_source_cycle_at; a true ALL_PHASES selection also updates the legacy
+  // last_full_cycle_at marker. Read by autopilot's source gate next tick.
+  // Skipped when:
   //   - opts.sourceId is unset (legacy callers — autopilot still here)
   //   - engine is null (no-DB path)
   //   - status is 'failed' or 'skipped' (don't mark a non-run as fresh)
@@ -2325,16 +2347,10 @@ export async function runCycle(
   if (opts.sourceId && engine && !dryRun && !aborted && (status === 'ok' || status === 'clean' || status === 'partial')) {
     try {
       const nowIso = new Date().toISOString();
-      // #2194 fix #3 (the cycle split): `last_source_cycle_at` is the NEW gate
-      // for per-source dispatch (source-scoped phases done). We ALSO keep
-      // `last_full_cycle_at` current so doctor's cycle-freshness check and any
-      // legacy reader stay valid — it's no longer a *gate* for the brain-wide
-      // phases (those gate on autopilot.last_global_at), so writing it on a
-      // source-only cycle does not re-introduce the freshness poisoning codex
-      // flagged in the rejected skip-based design.
+      const completedFullSelection = ALL_PHASES.every((phase) => phases.includes(phase));
       await engine.updateSourceConfig(opts.sourceId, {
         last_source_cycle_at: nowIso,
-        last_full_cycle_at: nowIso,
+        ...(completedFullSelection ? { last_full_cycle_at: nowIso } : {}),
       });
     } catch (e) {
       // Best-effort; cycle already succeeded by the time we get here.

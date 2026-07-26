@@ -103,6 +103,28 @@ describe('parseSkillFrontmatter', () => {
     expect(fm!.triggers).toEqual(['foo', 'bar']);
   });
 
+  test('parses Windows CRLF frontmatter and block arrays', () => {
+    const content = [
+      '---',
+      'name: windows-skill',
+      'writes_to:',
+      '  - people/',
+      'tools:',
+      '  - search',
+      'triggers:',
+      '  - "find this"',
+      '  - "locate that"',
+      '---',
+      '# windows-skill',
+    ].join('\r\n');
+    const fm = parseSkillFrontmatter(content);
+    expect(fm).not.toBeNull();
+    expect(fm!.name).toBe('windows-skill');
+    expect(fm!.writes_to).toEqual(['people/']);
+    expect(fm!.tools).toEqual(['search']);
+    expect(fm!.triggers).toEqual(['find this', 'locate that']);
+  });
+
   test('canonical brain_first: exempt populates the typed field', () => {
     const content = '---\nname: x\nbrain_first: exempt\n---\n';
     const fm = parseSkillFrontmatter(content);

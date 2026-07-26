@@ -436,6 +436,19 @@ describe('v0.31.8 — wedge migration force-retry hint (D19)', () => {
 // guard infrastructure (GBRAIN_DRIFT_LIMIT / GBRAIN_DRIFT_TIMEOUT_MS).
 // ============================================================================
 
+describe('multi_source_drift actionable scope', () => {
+  test('doctor excludes archived and sync-disabled sources and wires documented bounds', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    const start = source.indexOf('// 3b-multi-source. Multi-source drift');
+    const end = source.indexOf('// 3c.', start);
+    const block = source.slice(start, end > start ? end : start + 5000);
+    expect(block).toContain("archived IS NOT TRUE");
+    expect(block).toContain("(config ->> 'syncEnabled') IS DISTINCT FROM 'false'");
+    expect(block).toContain("_resolveEnvNumber('GBRAIN_DRIFT_LIMIT'");
+    expect(block).toContain("_resolveEnvNumber('GBRAIN_DRIFT_TIMEOUT_MS'");
+  });
+});
+
 describe('v0.32.4 — sync_freshness check', () => {
   // Stub engine: only checkSyncFreshness's executeRaw matters. Per-case rows
   // shape is `{id, name, local_path, last_sync_at}`.
@@ -789,7 +802,7 @@ describe('v0.41.27.0 — sync_freshness git short-circuit', () => {
     expect(result.details?.stale_count).toBe(1);
   });
 
-  test('case 8: stale + matching HEAD + DIRTY tree + chunker match + localOnly=true → warn (dirty gate fires)', async () => {
+  test('case 8: matching HEAD + DIRTY tree reports partial WIP, not stale indexed data', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
       await import('../src/core/git-head.ts');
@@ -802,9 +815,15 @@ describe('v0.41.27.0 — sync_freshness git short-circuit', () => {
         last_commit: 'abc', chunker_version: currentChunkerVersion },
     ]), { localOnly: true });
 
-    expect(result.status).toBe('warn');
-    expect(result.details?.unchanged_count).toBe(0);
-    expect(result.details?.stale_count).toBe(1);
+    expect(result.status).toBe('ok');
+    expect(result.message).toContain('tracked working-tree WIP not indexed');
+    expect(result.message).toContain(`'wip'`);
+    expect(result.details).toEqual({
+      unchanged_count: 1,
+      synced_recently_count: 0,
+      stale_count: 0,
+      working_tree_dirty_count: 1,
+    });
   });
 
   test('case 9 — D4 regression: localOnly=false (default) — git probes NEVER called', async () => {
@@ -963,6 +982,17 @@ describe('v0.41.32.0 — commit-relative staleness', () => {
 // These tests pin the read-side wiring so doctor and `gbrain jobs supervisor
 // status` (jobs.ts:805) cannot drift: both go through `summarizeCrashes`.
 describe('supervisor crash classifier wiring (v0.35.x)', () => {
+  test('a successful restart fences older crash history from current health', async () => {
+    const { currentSupervisorRunEvents } = await import('../src/commands/doctor.ts');
+    const events = [
+      { event: 'started', ts: '2026-07-26T01:00:00Z' },
+      { event: 'worker_exited', ts: '2026-07-26T01:01:00Z' },
+      { event: 'started', ts: '2026-07-26T02:00:00Z' },
+      { event: 'worker_spawned', ts: '2026-07-26T02:00:01Z' },
+    ];
+    expect(currentSupervisorRunEvents(events)).toEqual(events.slice(2));
+  });
+
   test('doctor.ts uses summarizeCrashes — no ad-hoc worker_exited filter', async () => {
     const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
     // Wired to the shared helper.
@@ -995,6 +1025,7 @@ describe('supervisor crash classifier wiring (v0.35.x)', () => {
     expect(source).toContain('legacy=');
     // Clean-exit count surfaces alongside crash count for transparency.
     expect(source).toContain('clean_exits_24h=');
+    expect(source).toContain('historical_crashes_24h=');
   });
 
   test('jobs.ts supervisor status uses summarizeCrashes — same wiring as doctor', async () => {
@@ -1384,6 +1415,28 @@ describe('BUG 4 — in-progress sync via live lock, not stale freshness', () => 
     const result = await checkSyncFreshness(engine);
     expect(result.status).toBe('fail');
     expect(result.message).toContain(`'wiki'`);
+  });
+
+  test('archived source is excluded from sync freshness', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, last_sync_at, config, archived)
+       VALUES ('archived-wiki', 'archived-wiki', '/tmp/archived-wiki', NULL, '{}'::jsonb, true)`,
+    );
+    const result = await checkSyncFreshness(engine);
+    expect(result.status).toBe('ok');
+    expect(result.message).toBe('No federated sources to sync');
+  });
+
+  test('sync-disabled source is excluded from sync freshness', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, last_sync_at, config, archived)
+       VALUES ('disabled-wiki', 'disabled-wiki', '/tmp/disabled-wiki', NULL, '{"syncEnabled":false}'::jsonb, false)`,
+    );
+    const result = await checkSyncFreshness(engine);
+    expect(result.status).toBe('ok');
+    expect(result.message).toBe('No federated sources to sync');
   });
 
   test('stale source WITH a live (non-expired) lock → ok (sync in progress)', async () => {

@@ -33,6 +33,10 @@ describe('doctor frontmatter_integrity — structural rendering (source-grep)', 
     expect(DOCTOR_SOURCE).toContain('AbortSignal.timeout(fmTimeoutMs)');
   });
 
+  test('doctor scans only active sources', () => {
+    expect(DOCTOR_SOURCE).toContain('activeOnly: true');
+  });
+
   test('source issues the DB COUNT(*) denominator query with deleted_at IS NULL', () => {
     expect(DOCTOR_SOURCE).toContain('deleted_at IS NULL');
     expect(DOCTOR_SOURCE).toContain('FROM pages WHERE source_id');

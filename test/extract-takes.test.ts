@@ -5,6 +5,7 @@ import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../src/core/takes-fence.ts';
 
 let engine: PGLiteEngine;
 let alicePageId: number;
+let codePageId: number;
 
 const ALICE_BODY = `# Alice Example
 
@@ -49,7 +50,11 @@ beforeAll(async () => {
   await engine.putPage('people/charlie-example', {
     title: 'Charlie', type: 'person', compiled_truth: CHARLIE_BODY_MALFORMED,
   });
+  const codePage = await engine.putPage('src/example-test-ts', {
+    title: 'Example test', type: 'code', compiled_truth: ALICE_BODY,
+  });
   alicePageId = alice.id;
+  codePageId = codePage.id;
 });
 
 afterAll(async () => {
@@ -59,7 +64,7 @@ afterAll(async () => {
 describe('extractTakesFromDb', () => {
   test('full walk: parses fenced pages and skips non-fenced', async () => {
     const result = await extractTakesFromDb(engine);
-    expect(result.pagesScanned).toBe(3);
+    expect(result.pagesScanned).toBe(4);
     expect(result.pagesWithTakes).toBe(2); // alice + charlie
     // alice has 3, charlie has 1 valid → 4 upserted
     expect(result.takesUpserted).toBe(4);
@@ -74,6 +79,7 @@ describe('extractTakesFromDb', () => {
     expect(allTakes).toHaveLength(1); // only row 3
     expect(allTakes[0].row_num).toBe(3);
     expect(allTakes[0].active).toBe(false);
+    expect(await engine.listTakes({ page_id: codePageId })).toHaveLength(0);
   });
 
   test('incremental: slugs filter restricts to specified pages', async () => {

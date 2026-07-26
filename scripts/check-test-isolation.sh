@@ -93,48 +93,79 @@ emit_violation() {
   violations=$((violations + 1))
 }
 
-# Read newline-separated file list; OK on macOS bash 3.2.
-while IFS= read -r f; do
-  [ -z "$f" ] && continue
-  file_count=$((file_count + 1))
-  # R1: env mutations.
-  env_lines=$(grep -nE 'process\.env\.[A-Za-z_][A-Za-z_0-9]*[[:space:]]*=[^=]|process\.env\[[^]]+\][[:space:]]*=[^=]|delete[[:space:]]+process\.env\.|delete[[:space:]]+process\.env\[|Object\.assign[[:space:]]*\([[:space:]]*process\.env|Reflect\.set[[:space:]]*\([[:space:]]*process\.env' "$f" 2>/dev/null || true)
-  if [ -n "$env_lines" ]; then
+ENV_MUTATION_RE='process\.env\.[A-Za-z_][A-Za-z_0-9]*[[:space:]]*=[^=]|process\.env\[[^]]+\][[:space:]]*=[^=]|delete[[:space:]]+process\.env\.|delete[[:space:]]+process\.env\[|Object\.assign[[:space:]]*\([[:space:]]*process\.env|Reflect\.set[[:space:]]*\([[:space:]]*process\.env'
+MOCK_MODULE_RE='mock\.module[[:space:]]*\('
+PGLITE_RE='new PGLiteEngine[[:space:]]*\('
+
+file_count=$(printf '%s\n' "$FILE_LIST" | awk 'NF { n++ } END { print n + 0 }')
+
+if command -v rg >/dev/null 2>&1; then
+  # Fast path: one recursive search per rule finds candidates, then only the
+  # small candidate set gets file-local detail checks. This avoids thousands
+  # of grep/awk process launches on Windows while preserving every rule.
+  ENV_FILES=$(rg -l -g '*.test.ts' -g '!*.serial.test.ts' -g '!**/e2e/**' "$ENV_MUTATION_RE" "$TARGET_DIR" 2>/dev/null || true)
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    f="${f//\\//}"
+    env_lines=$(rg -n "$ENV_MUTATION_RE" "$f" 2>/dev/null || true)
     emit_violation "$f" "R1" "process.env mutation; use withEnv() or rename to *.serial.test.ts" "$env_lines"
-  fi
+  done <<< "$ENV_FILES"
 
-  # R2: mock.module() anywhere.
-  mock_lines=$(grep -nE 'mock\.module[[:space:]]*\(' "$f" 2>/dev/null || true)
-  if [ -n "$mock_lines" ]; then
+  MOCK_FILES=$(rg -l -g '*.test.ts' -g '!*.serial.test.ts' -g '!**/e2e/**' "$MOCK_MODULE_RE" "$TARGET_DIR" 2>/dev/null || true)
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    f="${f//\\//}"
+    mock_lines=$(rg -n "$MOCK_MODULE_RE" "$f" 2>/dev/null || true)
     emit_violation "$f" "R2" "mock.module() leaks across files in the shard process; rename to *.serial.test.ts" "$mock_lines"
-  fi
+  done <<< "$MOCK_FILES"
 
-  # R3: PGLiteEngine outside ~50 lines after a beforeAll(.
-  if grep -qE 'new PGLiteEngine[[:space:]]*\(' "$f" 2>/dev/null; then
+  PGLITE_FILES=$(rg -l -g '*.test.ts' -g '!*.serial.test.ts' -g '!**/e2e/**' "$PGLITE_RE" "$TARGET_DIR" 2>/dev/null || true)
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    f="${f//\\//}"
     bad=$(awk '
       BEGIN { last_before_all = -1000 }
       /beforeAll[[:space:]]*\(/ { last_before_all = NR }
       /new PGLiteEngine[[:space:]]*\(/ {
-        if (NR - last_before_all > 50) {
-          printf "%d:%s\n", NR, $0
-        }
+        if (NR - last_before_all > 50) printf "%d:%s\n", NR, $0
       }
     ' "$f" 2>/dev/null)
     if [ -n "$bad" ]; then
       emit_violation "$f" "R3" "new PGLiteEngine(...) outside beforeAll() context (>50 lines); move into beforeAll" "$bad"
     fi
-  fi
-
-  # R4: PGLiteEngine creation requires afterAll{disconnect}.
-  if grep -qE 'new PGLiteEngine[[:space:]]*\(' "$f" 2>/dev/null; then
     if ! grep -qE 'afterAll[[:space:]]*\(' "$f" 2>/dev/null \
        || ! grep -qE '\.disconnect[[:space:]]*\(' "$f" 2>/dev/null; then
       emit_violation "$f" "R4" "creates PGLiteEngine but missing afterAll(() => engine.disconnect()); engine leaks across files in the shard process" ""
     fi
-  fi
-done <<EOF
-$FILE_LIST
-EOF
+  done <<< "$PGLITE_FILES"
+else
+  # Portable fallback for minimal environments without ripgrep.
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    env_lines=$(grep -nE "$ENV_MUTATION_RE" "$f" 2>/dev/null || true)
+    if [ -n "$env_lines" ]; then
+      emit_violation "$f" "R1" "process.env mutation; use withEnv() or rename to *.serial.test.ts" "$env_lines"
+    fi
+    mock_lines=$(grep -nE "$MOCK_MODULE_RE" "$f" 2>/dev/null || true)
+    if [ -n "$mock_lines" ]; then
+      emit_violation "$f" "R2" "mock.module() leaks across files in the shard process; rename to *.serial.test.ts" "$mock_lines"
+    fi
+    if grep -qE "$PGLITE_RE" "$f" 2>/dev/null; then
+      bad=$(awk '
+        BEGIN { last_before_all = -1000 }
+        /beforeAll[[:space:]]*\(/ { last_before_all = NR }
+        /new PGLiteEngine[[:space:]]*\(/ { if (NR - last_before_all > 50) printf "%d:%s\n", NR, $0 }
+      ' "$f" 2>/dev/null)
+      if [ -n "$bad" ]; then
+        emit_violation "$f" "R3" "new PGLiteEngine(...) outside beforeAll() context (>50 lines); move into beforeAll" "$bad"
+      fi
+      if ! grep -qE 'afterAll[[:space:]]*\(' "$f" 2>/dev/null \
+         || ! grep -qE '\.disconnect[[:space:]]*\(' "$f" 2>/dev/null; then
+        emit_violation "$f" "R4" "creates PGLiteEngine but missing afterAll(() => engine.disconnect()); engine leaks across files in the shard process" ""
+      fi
+    fi
+  done <<< "$FILE_LIST"
+fi
 
 if [ $violations -gt 0 ]; then
   echo

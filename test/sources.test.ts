@@ -172,6 +172,43 @@ describe('sources list', () => {
     const select = calls.find(c => c.sql.includes('ORDER BY (id = \'default\') DESC'));
     expect(select).toBeDefined();
   });
+
+  test('--json exposes archived state', async () => {
+    const { engine } = makeStub({
+      'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at': [
+        { id: 'old', name: 'old', local_path: '/tmp/old', last_commit: null, last_sync_at: null, config: '{"federated":true}', created_at: new Date(), archived: true },
+      ],
+      'COUNT(*)::int AS n FROM pages': [{ n: 3 }],
+    });
+    const lines: string[] = [];
+    const realLog = console.log;
+    console.log = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      await runSources(engine, ['list', '--json']);
+    } finally {
+      console.log = realLog;
+    }
+    const payload = JSON.parse(lines.join('\n')) as { sources: Array<{ archived?: boolean }> };
+    expect(payload.sources[0]?.archived).toBe(true);
+  });
+
+  test('human output marks archived rows before federation state', async () => {
+    const { engine } = makeStub({
+      'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at': [
+        { id: 'old', name: 'old', local_path: '/tmp/old', last_commit: null, last_sync_at: null, config: '{"federated":true}', created_at: new Date(), archived: true },
+      ],
+      'COUNT(*)::int AS n FROM pages': [{ n: 3 }],
+    });
+    const lines: string[] = [];
+    const realLog = console.log;
+    console.log = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      await runSources(engine, ['list']);
+    } finally {
+      console.log = realLog;
+    }
+    expect(lines.join('\n')).toContain('⚠ archived');
+  });
 });
 
 // ── remove ──────────────────────────────────────────────────
@@ -248,5 +285,32 @@ describe('sources federate / unfederate', () => {
     // Must preserve ttl_days while flipping federated.
     expect(parsed.ttl_days).toBe(90);
     expect(parsed.federated).toBe(false);
+  });
+});
+
+// ── enable-sync / disable-sync ─────────────────────────────
+
+describe('sources enable-sync / disable-sync', () => {
+  test('disable-sync sets config.syncEnabled=false while preserving other keys', async () => {
+    const { engine, calls } = makeStub({
+      'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at': [
+        { id: 'offline', name: 'offline', local_path: '/tmp/offline', last_commit: null, last_sync_at: null, config: '{"federated":true}', created_at: new Date() },
+      ],
+    });
+    await runSources(engine, ['disable-sync', 'offline']);
+    const upd = calls.find(c => c.sql.includes('UPDATE sources SET config'));
+    expect(upd).toBeDefined();
+    expect(JSON.parse(upd!.params[0] as string)).toEqual({ federated: true, syncEnabled: false });
+  });
+
+  test('enable-sync sets config.syncEnabled=true', async () => {
+    const { engine, calls } = makeStub({
+      'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at': [
+        { id: 'online', name: 'online', local_path: '/tmp/online', last_commit: null, last_sync_at: null, config: '{"syncEnabled":false}', created_at: new Date() },
+      ],
+    });
+    await runSources(engine, ['enable-sync', 'online']);
+    const upd = calls.find(c => c.sql.includes('UPDATE sources SET config'));
+    expect(JSON.parse(upd!.params[0] as string)).toEqual({ syncEnabled: true });
   });
 });

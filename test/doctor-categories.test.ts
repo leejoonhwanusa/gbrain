@@ -128,6 +128,7 @@ describe('categorizeCheck', () => {
     expect(categorizeCheck('embedding_provider')).toBe('brain');
     expect(categorizeCheck('graph_coverage')).toBe('brain');
     expect(categorizeCheck('sync_freshness')).toBe('brain');
+    expect(categorizeCheck('global_cycle_freshness')).toBe('brain');
   });
 
   test('returns the right category for a known skill name', () => {

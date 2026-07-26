@@ -77,6 +77,8 @@ export interface FanoutResult {
   skipped_cap: string[];
   /** Source ids skipped because they're in failure cooldown (#2194 fix #2). */
   skipped_cooldown: string[];
+  /** Source ids explicitly disabled from sync/maintenance. */
+  skipped_disabled: string[];
   /** True when this tick fell back to the legacy single-job path
    *  (no sources rows / engine empty). */
   legacy_fallback: boolean;
@@ -172,15 +174,15 @@ export function readLastFullCycleAt(src: SourceRow): Date | null {
 
 /**
  * A source needs work when either:
- *   1. It has never had a full cycle complete (`last_full_cycle_at` null), OR
- *   2. The last full cycle is older than the freshness floor.
+ *   1. It has never completed source-scoped maintenance, OR
+ *   2. Its latest successful source maintenance is older than the floor.
  *
- * `last_sync_at` is NOT consulted here — sync is one phase of a cycle, and
- * a brain may have fresh sync but stale extract/embed. The 60-min floor on
- * full-cycle is the canonical freshness signal for autopilot dispatch.
+ * Prefer `last_source_cycle_at`; fall back to the legacy
+ * `last_full_cycle_at` during rollout. Brain-wide phase freshness is tracked
+ * independently by `autopilot.last_global_at`.
  */
 export function isSourceStale(src: SourceRow, now = Date.now(), floorMin = FULL_CYCLE_FLOOR_MIN): boolean {
-  const last = readLastFullCycleAt(src);
+  const last = readLastSuccessAt(src);
   if (last === null) return true;
   const ageMin = (now - last.getTime()) / 60_000;
   return ageMin >= floorMin;
@@ -330,11 +332,13 @@ export function selectSourcesForDispatch(
   floorMin = FULL_CYCLE_FLOOR_MIN,
   recentFailures: Map<string, SourceFailure> = new Map(),
   cooldownOpts: CooldownOpts = { baseMin: FAILURE_COOLDOWN_BASE_MIN, capMin: FAILURE_COOLDOWN_CAP_MIN },
-): { dispatch: SourceRow[]; skippedFresh: SourceRow[]; skippedCap: SourceRow[]; skippedCooldown: SourceRow[] } {
+): { dispatch: SourceRow[]; skippedFresh: SourceRow[]; skippedCap: SourceRow[]; skippedCooldown: SourceRow[]; skippedDisabled: SourceRow[] } {
   const stale: SourceRow[] = [];
   const fresh: SourceRow[] = [];
   const cooldown: SourceRow[] = [];
+  const disabled: SourceRow[] = [];
   for (const s of sources) {
+    if (s.config?.syncEnabled === false) { disabled.push(s); continue; }
     if (!isSourceStale(s, now, floorMin)) { fresh.push(s); continue; }
     // #2194 fix #2: a stale source that recently failed is held in cooldown so
     // it can't re-dispatch every tick (the storm). Success clears it.
@@ -344,16 +348,16 @@ export function selectSourcesForDispatch(
     }
     stale.push(s);
   }
-  // Oldest-first ordering: NULL last_full_cycle_at sorts before any timestamp.
+  // Oldest-first ordering: no source-success timestamp sorts first.
   stale.sort((a, b) => {
-    const la = readLastFullCycleAt(a)?.getTime() ?? -Infinity;
-    const lb = readLastFullCycleAt(b)?.getTime() ?? -Infinity;
+    const la = readLastSuccessAt(a)?.getTime() ?? -Infinity;
+    const lb = readLastSuccessAt(b)?.getTime() ?? -Infinity;
     if (la !== lb) return la - lb;
     return a.id.localeCompare(b.id); // tiebreaker: stable alphabetical
   });
   const dispatch = stale.slice(0, fanoutMax);
   const skippedCap = stale.slice(fanoutMax);
-  return { dispatch, skippedFresh: fresh, skippedCap, skippedCooldown: cooldown };
+  return { dispatch, skippedFresh: fresh, skippedCap, skippedCooldown: cooldown, skippedDisabled: disabled };
 }
 
 /**
@@ -405,7 +409,7 @@ export async function dispatchPerSource(
     } else {
       log(`[dispatch] job #${job.id} autopilot-cycle (legacy single-source)`);
     }
-    return { dispatched: [], skipped_fresh: [], skipped_cap: [], skipped_cooldown: [], legacy_fallback: true };
+    return { dispatched: [], skipped_fresh: [], skipped_cap: [], skipped_cooldown: [], skipped_disabled: [], legacy_fallback: true };
   }
 
   // #2194 fix #2: load recent per-source failures + cooldown knobs so a
@@ -424,7 +428,7 @@ export async function dispatchPerSource(
     cooldownOpts = { baseMin: 0, capMin: FAILURE_COOLDOWN_CAP_MIN };
   }
 
-  const { dispatch, skippedFresh, skippedCap, skippedCooldown } =
+  const { dispatch, skippedFresh, skippedCap, skippedCooldown, skippedDisabled } =
     selectSourcesForDispatch(sources, opts.fanoutMax, Date.now(), FULL_CYCLE_FLOOR_MIN, recentFailures, cooldownOpts);
 
   const dispatched: string[] = [];
@@ -507,6 +511,7 @@ export async function dispatchPerSource(
     skipped_fresh: skippedFresh.map(s => s.id),
     skipped_cap: skippedCap.map(s => s.id),
     skipped_cooldown: skippedCooldown.map(s => s.id),
+    skipped_disabled: skippedDisabled.map(s => s.id),
     legacy_fallback: false,
   };
 }

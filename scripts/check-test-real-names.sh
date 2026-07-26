@@ -120,6 +120,9 @@ while IFS= read -r line; do
   [ -z "$line" ] && continue
   # Extract filename and content (everything after second :).
   file="${line%%:*}"
+  # ripgrep emits native backslashes on Windows even when the search root
+  # was written with `/`; normalize before comparing portable allowlist keys.
+  file="${file//\\//}"
   rest="${line#*:}"
   # rest is "lineno:content" — strip lineno.
   content="${rest#*:}"

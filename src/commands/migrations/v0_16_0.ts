@@ -15,11 +15,12 @@
  * Phases (all idempotent):
  *   A. Schema — gbrain init --migrate-only (creates tables via SCHEMA_SQL).
  *   B. Verify — confirm all three tables exist.
- *   C. Record — append completed.jsonl.
+ * Ledger recording is owned by the apply-migrations runner after the
+ * orchestrator returns. The orchestrator itself never writes the ledger,
+ * including during dry-run.
  */
 
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
-import { appendCompletedMigration } from '../../core/preferences.ts';
 import { loadConfig, toEngineConfig } from '../../core/config.ts';
 import { createEngine } from '../../core/engine-factory.ts';
 
@@ -103,18 +104,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
 }
 
 function finalize(phases: OrchestratorPhaseResult[], status: 'complete' | 'partial' | 'failed'): OrchestratorResult {
-  if (status !== 'failed') {
-    try {
-      appendCompletedMigration({
-        version: '0.16.0',
-        completed_at: new Date().toISOString(),
-        status: status as 'complete' | 'partial',
-        phases: phases.map(p => ({ name: p.name, status: p.status })),
-      });
-    } catch {
-      // Recording is best-effort.
-    }
-  }
+  // completed.jsonl is appended exactly once by apply-migrations.ts.
   return { version: '0.16.0', status, phases };
 }
 

@@ -27,7 +27,7 @@ import {
   type ParseValidationCode,
   type ParseValidationError,
 } from './markdown.ts';
-import { isSyncable, pruneDir, slugifyPath } from './sync.ts';
+import { isSyncable, loadGbrainIgnoreGlobs, pruneDir, slugifyPath } from './sync.ts';
 
 export type { ParseValidationCode };
 
@@ -378,6 +378,10 @@ export interface ScanOpts {
   /** Limit scan to one source. When omitted, all registered sources with a
    *  local_path are scanned. */
   sourceId?: string;
+  /** Exclude archived sources and sources whose syncEnabled flag is false.
+   * Doctor enables this for its broad health scan; an explicit validation
+   * command can still inspect an inactive source by leaving this false. */
+  activeOnly?: boolean;
   /** Missing frontmatter is optional metadata coverage for broad document
    * sources. Set true for curated page repos that require every file to carry
    * YAML frontmatter. */
@@ -412,7 +416,7 @@ export async function scanBrainSources(
   engine: BrainEngine,
   opts: ScanOpts = {},
 ): Promise<AuditReport> {
-  const sources = await listSources(engine, opts.sourceId);
+  const sources = await listSources(engine, opts.sourceId, opts.activeOnly ?? false);
   const totals: Partial<Record<ParseValidationCode, number>> = {};
   const perSource: PerSourceReport[] = [];
   let grandTotal = 0;
@@ -574,6 +578,7 @@ function scanOneSource(
   const errorsByCode: Partial<Record<ParseValidationCode, number>> = {};
   const sample: PerSourceReport['sample'] = [];
   const rootResolved = resolve(sourcePath);
+  const exclude = loadGbrainIgnoreGlobs(rootResolved);
   let scanned = 0;
   let total = 0;
   let ignoredMissingOpen = 0;
@@ -594,7 +599,7 @@ function scanOneSource(
     // visitDir is consulted from walkDir directly (passed below). The
     // per-file visit closure doesn't need it.
     const relPath = relative(rootResolved, absPath);
-    if (!isSyncable(relPath, { strategy: 'markdown' })) return true;
+    if (!isSyncable(relPath, { strategy: 'markdown', exclude })) return true;
     scanned++;
     let content: string;
     try {
@@ -714,15 +719,22 @@ export function walkDir(
   }
 }
 
-async function listSources(engine: BrainEngine, sourceId?: string): Promise<SourceRow[]> {
+async function listSources(
+  engine: BrainEngine,
+  sourceId?: string,
+  activeOnly = false,
+): Promise<SourceRow[]> {
+  const activeClause = activeOnly
+    ? ` AND archived IS NOT TRUE AND (config ->> 'syncEnabled') IS DISTINCT FROM 'false'`
+    : '';
   if (sourceId) {
     const rows = await engine.executeRaw<SourceRow>(
-      `SELECT id, local_path FROM sources WHERE id = $1`,
+      `SELECT id, local_path FROM sources WHERE id = $1${activeClause}`,
       [sourceId],
     );
     return rows;
   }
   return engine.executeRaw<SourceRow>(
-    `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL ORDER BY id`,
+    `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL${activeClause} ORDER BY id`,
   );
 }

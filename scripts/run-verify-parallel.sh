@@ -44,6 +44,7 @@ CHECKS=(
   "check:progress"
   "check:test-isolation"
   "check:wasm"
+  "check:image-decoders"
   "check:admin-build"
   "check:admin-scope-drift"
   "check:cli-exec"
@@ -108,6 +109,16 @@ fi
 START_TS=$(date +%s)
 echo "[verify-parallel] running ${#CHECKS[@]} checks in parallel (timeout=${TIMEOUT}s, logs=$LOG_DIR)" >&2
 
+# Compiled smoke checks contend on Bun's compiler/cache when launched beside
+# admin-build and each other on Windows. Keep them in the authoritative CHECKS
+# list, but execute them serially after the ordinary parallel wave.
+is_serial_check() {
+  case "$1" in
+    check:wasm|check:image-decoders) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # ──────────────────────────────────────────────────────────────────────────
 # Spawn one background process per check. Each child captures its own exit
 # code into a sentinel file under $LOG_DIR/<safe-name>.exit; the parent
@@ -123,6 +134,9 @@ for c in "${CHECKS[@]}"; do
   SAFE_NAMES+=("$safe")
   LOG_FILE="$LOG_DIR/$safe.log"
   EXIT_FILE="$LOG_DIR/$safe.exit"
+  if is_serial_check "$c"; then
+    continue
+  fi
   (
     if [ -n "$TIMEOUT_BIN" ]; then
       "$TIMEOUT_BIN" "${TIMEOUT}s" bun run "$c" > "$LOG_FILE" 2>&1
@@ -145,6 +159,20 @@ done
 # Wait for every background job. Ignore wait's aggregate exit — exit codes
 # live in the sentinel files.
 for pid in "${PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+# Run compiler-heavy smoke checks one at a time after the parallel wave.
+for c in "${CHECKS[@]}"; do
+  is_serial_check "$c" || continue
+  safe="${c//:/_}"
+  LOG_FILE="$LOG_DIR/$safe.log"
+  EXIT_FILE="$LOG_DIR/$safe.exit"
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" "${TIMEOUT}s" bun run "$c" > "$LOG_FILE" 2>&1
+  else
+    bun run "$c" > "$LOG_FILE" 2>&1
+  fi
+  echo "$?" > "$EXIT_FILE"
+done
 
 END_TS=$(date +%s)
 ELAPSED=$((END_TS - START_TS))
