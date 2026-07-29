@@ -14,6 +14,38 @@ All notable changes to GBrain will be documented in this file.
 - **Compiled Windows binaries can detach the Minions supervisor correctly.** The detached re-exec path now drops Bun's virtual `B:/~BUN/root/...` entrypoint instead of feeding it back to the compiled executable as an unknown command; source execution still preserves `src/cli.ts`.
 - **Deployments can impose a conservative embedding request cap without editing a provider recipe.** `GBRAIN_AI_EMBED_MAX_BATCH_TOKENS` is read from the gateway's configure-time environment snapshot and overrides a recipe cap only when it is a positive safe integer.
 
+## [0.42.57.0] - 2026-07-29
+
+**Deferred embedding now has a finish line. A successful sync either proves search vectors are current or hands the remaining work to a real background job.**
+
+`gbrain sync --no-embed` used to finish cleanly after writing content while leaving its vector backlog with no guaranteed owner. A page-level embedding failure could also be logged and skipped while the background job itself was marked complete. That combination made a green command line a weak signal: the text was present, but semantic search could stay incomplete indefinitely.
+
+Now every successful deferred sync checks the same stale-chunk predicate the backfill worker uses. If work remains, it queues a source-scoped `embed-backfill`; if one is already waiting, active, or delayed for retry, the sync reports that handoff instead of creating a duplicate. `--no-auto-embed` remains the explicit opt-out. Backfill failures preserve completed pages, leave failed chunks stale, and make the job retry instead of declaring success.
+
+The maintenance view is truthful too. `gbrain doctor` and `gbrain reindex --markdown` now compare each live markdown page with its exact effective contextual-retrieval mode and corpus generation, including search-mode changes, the kill switch, and trusted page or source overrides. A non-null historical mode no longer passes as current merely because it exists.
+
+### What changes in practice
+
+| Path | Before | Now |
+|---|---|---|
+| Successful deferred sync | Could leave stale vectors unowned | Verifies zero stale chunks or queues the backfill |
+| One page fails to embed | Worker could finish green | Partial progress stays durable and the job retries |
+| Search mode changes | Doctor could miss persisted drift | Doctor and reindex share the exact active-mode predicate |
+
+## To take advantage of v0.42.57.0
+
+Run `gbrain upgrade`. There is no schema migration. The next successful deferred sync will reconcile any existing vector backlog automatically; run `gbrain doctor` afterward to inspect contextual-retrieval mode and generation alignment. Operators who intentionally want content-only syncs can keep using `--no-auto-embed`.
+
+### Itemized changes
+
+#### Fixed
+- Successful explicit and automatic no-embed syncs now verify or enqueue source-scoped stale-vector work, including pre-existing backlog on an otherwise up-to-date source.
+- Embed backfills no longer report completion after a page failure or a cancellation inside the final short batch, and delayed retry jobs suppress duplicate submissions.
+- Contextual-retrieval Doctor (local and remote surfaces) and markdown reindex now share one drift inspection covering chunker version, effective mode, and corpus generation; the local `buildChecks` path is pinned as a load-bearing check so the implementation cannot exist without appearing in real CLI output.
+
+#### Tests
+- Added regression coverage for explicit no-embed handoff and opt-out, stale backlog reconciliation, page failure and final-batch cancellation, delayed-job coalescing, exact mode and generation drift, local Doctor orchestration, and reindex convergence.
+
 ## [0.42.56.0] - 2026-07-02
 
 **Life Chronicle: gbrain gains a temporal spine. Meetings and transcripts project into a queryable timeline, entities carry a bi-temporal ontology (sourced, confidence-weighted properties that supersede over time), and a low-friction diary captures interiority — so an agent can reconstruct "what happened the week of X", answer "when did I last interact with Y", and see how an entity's role or stance changed, instead of re-deriving chronology from scratch every session.** Built entirely on existing primitives (pages, the `facts` table, `timeline_entries`) — no new datastore. Auto-emission is off by default; opt in per below.

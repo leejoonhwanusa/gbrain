@@ -10,6 +10,10 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runReindex } from '../src/commands/reindex.ts';
 import { MARKDOWN_CHUNKER_VERSION } from '../src/core/chunkers/recursive.ts';
+import {
+  computeCorpusGeneration,
+  DEFAULT_CONTEXTUAL_RETRIEVAL_HAIKU_MODEL,
+} from '../src/core/contextual-retrieval-service.ts';
 
 let engine: PGLiteEngine;
 
@@ -26,6 +30,12 @@ afterAll(async () => {
 beforeEach(async () => {
   await (engine as any).db.exec('DELETE FROM content_chunks');
   await (engine as any).db.exec('DELETE FROM pages');
+  await engine.setConfig('search.mode', 'balanced');
+});
+
+const titleGeneration = () => computeCorpusGeneration({
+  crMode: 'title',
+  haikuModel: DEFAULT_CONTEXTUAL_RETRIEVAL_HAIKU_MODEL,
 });
 
 async function seedLegacyPage(slug: string, body: string, sourcePath: string | null = null) {
@@ -77,8 +87,9 @@ describe('gbrain reindex --markdown (v0.32.7)', () => {
     // OFF) does both; reindex tests use --no-embed to avoid API keys.
     await runReindex(engine, ['--markdown', '--no-embed']);
     await engine.executeRaw(
-      `UPDATE pages SET contextual_retrieval_mode = 'title'
+      `UPDATE pages SET contextual_retrieval_mode = 'title', corpus_generation = $1
         WHERE slug = 'note-e' AND contextual_retrieval_mode IS NULL`,
+      [titleGeneration()],
     );
     const second = await runReindex(engine, ['--markdown', '--no-embed']);
     expect(second.pending).toBe(0);
@@ -138,13 +149,26 @@ describe('gbrain reindex --markdown (v0.32.7)', () => {
     // contextual_retrieval_mode IS NULL, so seeding 'title' here lets the
     // page legitimately skip the reindex sweep.
     await engine.executeRaw(
-      `INSERT INTO pages (slug, type, title, compiled_truth, page_kind, chunker_version, contextual_retrieval_mode)
-       VALUES ('note-current', 'note', 'note-current', 'current body', 'markdown', $1, 'title')`,
-      [MARKDOWN_CHUNKER_VERSION],
+      `INSERT INTO pages (slug, type, title, compiled_truth, page_kind, chunker_version, contextual_retrieval_mode, corpus_generation)
+       VALUES ('note-current', 'note', 'note-current', 'current body', 'markdown', $1, 'title', $2)`,
+      [MARKDOWN_CHUNKER_VERSION, titleGeneration()],
     );
 
     const result = await runReindex(engine, ['--markdown', '--no-embed']);
     expect(result.pending).toBe(1);
     expect(result.reindexed).toBe(1);
+  });
+
+  test('dry-run includes active mode and corpus-generation drift, not only NULL modes', async () => {
+    await engine.setConfig('search.mode', 'conservative');
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, type, title, compiled_truth, page_kind, chunker_version, contextual_retrieval_mode, corpus_generation)
+       VALUES ('note-mode-drift', 'note', 'note-mode-drift', 'body', 'markdown', $1, 'title', $2)`,
+      [MARKDOWN_CHUNKER_VERSION, titleGeneration()],
+    );
+
+    const result = await runReindex(engine, ['--markdown', '--dry-run']);
+    expect(result.pending).toBe(1);
+    expect(result.reindexed).toBe(0);
   });
 });

@@ -41,7 +41,10 @@ import {
   type SyncEmbedMode,
 } from '../core/embedding.ts';
 import { estimateCostFromChars } from '../core/embedding-pricing.ts';
-import { SPEND_CAP_CONFIG_KEY } from '../core/embed-backfill-submit.ts';
+import {
+  SPEND_CAP_CONFIG_KEY,
+  submitEmbedBackfill,
+} from '../core/embed-backfill-submit.ts';
 import type { SyncManifest } from '../core/sync.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
@@ -222,6 +225,78 @@ export interface SyncResult {
    * everything," the exact misdiagnosis in the #1794 recurrence report.
    */
   bankedFiles?: number;
+}
+
+type DeferredBackfillEnsureResult =
+  | { status: 'verified_no_work'; staleChunks: 0 }
+  | { status: 'submitted'; staleChunks: number; jobId: number }
+  | { status: 'already_pending'; staleChunks: number };
+
+/**
+ * Close the deferred-embedding half of a successful sync.
+ *
+ * A sync that deliberately writes NULL embeddings must not exit with a silent
+ * gap. We first verify the source's real stale predicate (NULL embeddings plus
+ * model-signature drift). If work exists, submit a backfill job. An active or
+ * waiting job is equivalent to a successful hand-off. A recently completed
+ * job is not: fresh NULL chunks may have appeared after it finished, so bypass
+ * only that completed-job cooldown and submit the newly verified work.
+ *
+ * Spend-cap refusal and submission errors propagate. The content sync has
+ * already committed, but the command must be non-zero/degraded rather than
+ * claiming the deferred work is covered when it is not.
+ */
+async function ensureDeferredEmbeddingBackfill(
+  engine: BrainEngine,
+  sourceId: string,
+  reason: string,
+): Promise<DeferredBackfillEnsureResult> {
+  const staleChunks = await engine.countStaleChunks({
+    sourceId,
+    signature: currentEmbeddingSignature(),
+  });
+  if (staleChunks === 0) {
+    return { status: 'verified_no_work', staleChunks: 0 };
+  }
+
+  let submission = await submitEmbedBackfill(engine, sourceId, { reason });
+  if (
+    submission.status === 'cooldown' &&
+    submission.cooldownRemainingSeconds !== undefined
+  ) {
+    // A completed job inside the cooldown cannot cover work that is still
+    // stale now. Active/waiting jobs return cooldown without a remaining
+    // duration and are deliberately left alone.
+    submission = await submitEmbedBackfill(engine, sourceId, {
+      reason,
+      cooldownMinOverride: 0,
+    });
+  }
+
+  if (submission.status === 'submitted') {
+    return {
+      status: 'submitted',
+      staleChunks,
+      jobId: submission.jobId!,
+    };
+  }
+  if (
+    submission.status === 'cooldown' &&
+    submission.cooldownRemainingSeconds === undefined
+  ) {
+    return { status: 'already_pending', staleChunks };
+  }
+  if (submission.status === 'spend_capped') {
+    throw new Error(
+      `embed-backfill for source "${sourceId}" is blocked by the 24h spend cap ` +
+      `($${submission.spend24hUsd ?? '?'} / $${submission.spendCapUsd ?? '?'}) ` +
+      `with ${staleChunks} stale chunk(s) remaining`,
+    );
+  }
+  throw new Error(
+    `embed-backfill for source "${sourceId}" was not queued with ` +
+    `${staleChunks} stale chunk(s) remaining`,
+  );
 }
 
 /**
@@ -3762,33 +3837,32 @@ See also:
       ) {
         manageGitignore(src.local_path!, engine.kind);
       }
-      // D18: auto-enqueue embed-backfill per source (unless opted out).
-      // v0.41.13.0 (T7 / D-V3-5): partial excluded — the next clean sync
-      // re-walks the diff and re-decides whether to enqueue embed for
-      // pages whose content actually changed.
-      // v0.42.42.0 (#2139): `autoDeferEmbeds` enqueues even on the v2-OFF
-      // legacy path — otherwise the gate's auto-defer would strand
-      // NULL-embedded chunks with no queued job to embed them.
+      // D18: verify or enqueue embed-backfill per source (unless opted out).
+      // Every successful deferred path, including an explicit --no-embed and
+      // an up-to-date content sync with a pre-existing vector backlog, must
+      // close the hand-off. Partial/blocked runs remain excluded because their
+      // source state is not yet reconciled.
       if (
-        (v2Enabled || autoDeferEmbeds) &&
+        (v2Enabled || autoDeferEmbeds || noEmbed) &&
         !noAutoEmbed &&
         !dryRun &&
         result.status !== 'dry_run' &&
-        result.status !== 'up_to_date' &&
+        result.status !== 'blocked_by_failures' &&
         result.status !== 'partial'
       ) {
-        try {
-          const { submitEmbedBackfill } = await import('../core/embed-backfill-submit.ts');
-          const sub = await submitEmbedBackfill(engine, src.id, { reason: 'sync_all' });
-          if (sub.status === 'submitted') {
-            writeHuman(`  → embed-backfill job ${sub.jobId} queued for ${src.name}`);
-          } else if (sub.status === 'cooldown') {
-            writeHuman(`  → embed-backfill skipped (cooldown) for ${src.name}`);
-          } else if (sub.status === 'spend_capped') {
-            writeHuman(`  → embed-backfill skipped (24h spend cap $${sub.spendCapUsd}) for ${src.name}`);
-          }
-        } catch (e) {
-          process.stderr.write(`  → embed-backfill submission failed for ${src.name}: ${e instanceof Error ? e.message : String(e)}\n`);
+        const ensured = await ensureDeferredEmbeddingBackfill(engine, src.id, 'sync_all');
+        if (ensured.status === 'submitted') {
+          writeHuman(
+            `  → embed-backfill job ${ensured.jobId} queued for ${src.name} ` +
+            `(${ensured.staleChunks} stale chunk(s))`,
+          );
+        } else if (ensured.status === 'already_pending') {
+          writeHuman(
+            `  → embed-backfill already queued/active for ${src.name} ` +
+            `(${ensured.staleChunks} stale chunk(s))`,
+          );
+        } else {
+          writeHuman(`  → embed-backfill verified for ${src.name}: no stale chunks`);
         }
       }
       return result;
@@ -4034,25 +4108,30 @@ See also:
         manageGitignore(effectiveRepoPath, engine.kind);
       }
     }
-    // v0.42.42.0 (#2139, Step 4b): the inline gate auto-deferred this run's
-    // embeds (non-TTY, above floor) — enqueue a capped backfill job so the
-    // NULL-embedded chunks get embedded out of band instead of being stranded.
+    // The command wrote (or deliberately preserved) NULL embeddings through
+    // either explicit --no-embed or the cost gate's auto-defer. Verify there
+    // is no stale work, or hand it to a queued/active backfill before returning.
     if (
-      singleSourceAutoDefer &&
+      opts.noEmbed &&
+      !noAutoEmbed &&
       result.status !== 'dry_run' &&
-      result.status !== 'up_to_date' &&
+      result.status !== 'blocked_by_failures' &&
       result.status !== 'partial'
     ) {
-      try {
-        const { submitEmbedBackfill } = await import('../core/embed-backfill-submit.ts');
-        const sub = await submitEmbedBackfill(engine, sourceId, { reason: 'sync_autodefer' });
-        if (sub.status === 'submitted') {
-          process.stderr.write(`  → embed-backfill job ${sub.jobId} queued (deferred inline embed).\n`);
-        } else if (sub.status === 'cooldown') {
-          process.stderr.write(`  → embed-backfill skipped (cooldown); run \`gbrain embed --stale\` to drain now.\n`);
-        }
-      } catch (e) {
-        process.stderr.write(`  → embed-backfill submission failed: ${e instanceof Error ? e.message : String(e)}\n`);
+      const reason = singleSourceAutoDefer ? 'sync_autodefer' : 'sync_no_embed';
+      const ensured = await ensureDeferredEmbeddingBackfill(engine, sourceId, reason);
+      if (ensured.status === 'submitted') {
+        process.stderr.write(
+          `  → embed-backfill job ${ensured.jobId} queued ` +
+          `(${ensured.staleChunks} stale chunk(s); ${reason}).\n`,
+        );
+      } else if (ensured.status === 'already_pending') {
+        process.stderr.write(
+          `  → embed-backfill already queued/active ` +
+          `(${ensured.staleChunks} stale chunk(s)).\n`,
+        );
+      } else {
+        process.stderr.write('  → embed-backfill verified: no stale chunks.\n');
       }
     }
     return;

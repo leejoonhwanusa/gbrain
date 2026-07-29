@@ -37,7 +37,10 @@ import {
 import { loadSearchModeConfig, resolveSearchMode } from './search/mode.ts';
 import { normalizeAliasList } from './search/alias-normalize.ts';
 import { isUndefinedTableError, warnOncePerProcess } from './utils.ts';
-import { computeCorpusGeneration } from './contextual-retrieval-service.ts';
+import {
+  computeCorpusGeneration,
+  DEFAULT_CONTEXTUAL_RETRIEVAL_HAIKU_MODEL,
+} from './contextual-retrieval-service.ts';
 import { runGuardrails } from './guardrails.ts';
 
 /**
@@ -721,7 +724,7 @@ export async function importFromContent(
       ? null
       : computeCorpusGeneration({
           crMode: effectiveCRMode,
-          haikuModel: 'anthropic:claude-haiku-4-5-20251001',
+          haikuModel: DEFAULT_CONTEXTUAL_RETRIEVAL_HAIKU_MODEL,
         });
 
   // Transaction wraps all DB writes. Every per-page tx call carries the

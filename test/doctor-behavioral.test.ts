@@ -218,6 +218,7 @@ describe('buildChecks — orchestrator against PGLite', () => {
       'brain_score',
       'sync_freshness',
       'search_mode',
+      'contextual_retrieval_coverage',
       'eval_drift',
       'reranker_health',
       'embedding_width_consistency',

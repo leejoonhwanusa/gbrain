@@ -33,6 +33,7 @@ import { resolve } from 'path';
 // v0.41.15.0 (T10, D9): per-batch parallel workers.
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
+import { inspectContextualRetrievalState } from '../core/contextual-retrieval-drift.ts';
 
 interface ReindexOpts {
   /** Cap total pages reindexed. Useful for triage runs on huge brains. */
@@ -89,57 +90,6 @@ function parseArgs(args: string[]): ReindexOpts {
   return out;
 }
 
-/**
- * Count markdown pages that need re-embedding. v0.40.3.0: predicate
- * extends from chunker_version drift alone to ALSO catch contextual
- * retrieval state drift (D26 P0-1). A page enters the sweep if either:
- *
- *   (a) chunker_version is below the current value — pre-v40 pages that
- *       haven't been touched by the wrapper bump yet
- *   (b) contextual_retrieval_mode is NULL — pages that have never been
- *       evaluated against the CR ladder (pre-v40 brains)
- *
- * D26 P0-4 IS DISTINCT FROM is used where comparing against a value; for
- * NULL detection we use IS NULL directly. Page-frontmatter overrides
- * (D5) are handled at re-import time: importFromFile re-parses the
- * frontmatter and the resolver picks the right tier for that page.
- *
- * Global-mode-vs-stamped-mode drift (e.g. user upgraded balanced→tokenmax,
- * skipped the post-upgrade prompt, then later ran reindex) is caught by
- * the IS NULL clause for pre-v81 brains AND by a future T10 mode-switch
- * hook for post-v81 brains. The simple `chunker_version OR mode IS NULL`
- * predicate covers the headline upgrade case the wave is shipping.
- */
-async function countPending(engine: BrainEngine): Promise<number> {
-  const rows = await engine.executeRaw<{ count: string | number }>(
-    `SELECT COUNT(*)::bigint AS count
-       FROM pages
-      WHERE page_kind = 'markdown'
-        AND (chunker_version < $1 OR contextual_retrieval_mode IS NULL)
-        AND deleted_at IS NULL`,
-    [MARKDOWN_CHUNKER_VERSION],
-  );
-  return Number(rows[0]?.count ?? 0);
-}
-
-/**
- * Read a single batch of pending rows. Ordered by id so re-runs after
- * partial completion pick up where they left off without re-doing pages
- * whose chunker_version was already bumped.
- */
-async function readBatch(engine: BrainEngine, batchSize: number): Promise<Array<{ slug: string; source_path: string | null; compiled_truth: string; source_id: string }>> {
-  return engine.executeRaw(
-    `SELECT slug, source_path, compiled_truth, source_id
-       FROM pages
-      WHERE page_kind = 'markdown'
-        AND (chunker_version < $1 OR contextual_retrieval_mode IS NULL)
-        AND deleted_at IS NULL
-      ORDER BY id ASC
-      LIMIT $2`,
-    [MARKDOWN_CHUNKER_VERSION, batchSize],
-  );
-}
-
 export async function runReindex(engine: BrainEngine, args: string[]): Promise<ReindexResult> {
   const opts = parseArgs(args);
 
@@ -155,7 +105,9 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
     return { pending: 0, reindexed: 0, skipped: 0, failed: 0, dryRun: !!opts.dryRun, chunkerVersion: MARKDOWN_CHUNKER_VERSION };
   }
 
-  const pending = await countPending(engine);
+  const inspection = await inspectContextualRetrievalState(engine);
+  const pendingRows = inspection.driftedPages;
+  const pending = pendingRows.length;
 
   if (opts.json && pending === 0) {
     process.stdout.write(JSON.stringify({ pending: 0, reindexed: 0, skipped: 0, failed: 0, chunker_version: MARKDOWN_CHUNKER_VERSION }) + '\n');
@@ -163,7 +115,11 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
   }
 
   if (pending === 0) {
-    process.stderr.write(`[reindex] All markdown pages already at chunker_version ${MARKDOWN_CHUNKER_VERSION}. Nothing to do.\n`);
+    process.stderr.write(
+      `[reindex] All markdown pages aligned to chunker_version ` +
+      `${MARKDOWN_CHUNKER_VERSION}, search.mode=${inspection.activeSearchMode}, ` +
+      `CR mode=${inspection.globalMode}, and corpus generation. Nothing to do.\n`,
+    );
     return { pending: 0, reindexed: 0, skipped: 0, failed: 0, dryRun: !!opts.dryRun, chunkerVersion: MARKDOWN_CHUNKER_VERSION };
   }
 
@@ -186,11 +142,13 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
   let failed = 0;
   const BATCH = 100;
   const repoPath = opts.repoPath ? resolve(opts.repoPath) : null;
+  let nextPendingIndex = 0;
 
   while (reindexed + skipped + failed < target) {
     const remaining = target - (reindexed + skipped + failed);
     const batchSize = Math.min(BATCH, remaining);
-    const batch = await readBatch(engine, batchSize);
+    const batch = pendingRows.slice(nextPendingIndex, nextPendingIndex + batchSize);
+    nextPendingIndex += batch.length;
     if (batch.length === 0) break;
 
     // v0.41.15.0 (T10, D9): per-batch sliding pool. Counters are JS-
@@ -209,12 +167,12 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
       onItem: async (row) => {
         reporter.tick();
         try {
-          if (row.source_path && repoPath) {
-            const absPath = resolve(repoPath, row.source_path);
+          if (row.sourcePath && repoPath) {
+            const absPath = resolve(repoPath, row.sourcePath);
             if (existsSync(absPath)) {
-              await importFromFile(engine, absPath, row.source_path, {
+              await importFromFile(engine, absPath, row.sourcePath, {
                 noEmbed: !!opts.noEmbed,
-                sourceId: row.source_id,
+                sourceId: row.sourceId,
                 inferFrontmatter: false,
                 forceRechunk: true,
               });
@@ -230,17 +188,17 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
           // frontmatter and OVERWROTE the page's real frontmatter / title /
           // timeline (codex catch). The round-trip preserves everything while
           // still re-chunking + bumping chunker_version.
-          const page = await engine.getPage(row.slug, { sourceId: row.source_id });
+          const page = await engine.getPage(row.slug, { sourceId: row.sourceId });
           if (!page) { skipped++; return; }
-          const tags = await engine.getTags(row.slug, { sourceId: row.source_id });
+          const tags = await engine.getTags(row.slug, { sourceId: row.sourceId });
           const fullMarkdown = serializeMarkdown(
             page.frontmatter ?? {},
-            page.compiled_truth ?? row.compiled_truth,
+            page.compiled_truth ?? '',
             page.timeline ?? '',
             { type: page.type, title: page.title, tags },
           );
           await importFromContent(engine, row.slug, fullMarkdown, {
-            sourceId: row.source_id,
+            sourceId: row.sourceId,
             noEmbed: !!opts.noEmbed,
             forceRechunk: true,
           });

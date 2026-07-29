@@ -200,7 +200,8 @@ export interface ReembedPageArgs {
   releaseSynopsisLease?: () => Promise<void>;
 }
 
-const DEFAULT_HAIKU_MODEL = 'anthropic:claude-haiku-4-5-20251001';
+export const DEFAULT_CONTEXTUAL_RETRIEVAL_HAIKU_MODEL =
+  'anthropic:claude-haiku-4-5-20251001';
 
 /**
  * Re-embed one page through the active CR mode. Implements the D26 P0-2
@@ -253,7 +254,10 @@ export async function reembedPageWithContextualRetrieval(
       args.pageSlug,
       args.sourceId,
       resolution.mode,
-      computeCorpusGeneration({ crMode: resolution.mode, haikuModel: args.haikuModel ?? DEFAULT_HAIKU_MODEL }),
+      computeCorpusGeneration({
+        crMode: resolution.mode,
+        haikuModel: args.haikuModel ?? DEFAULT_CONTEXTUAL_RETRIEVAL_HAIKU_MODEL,
+      }),
     );
     return { kind: 'skipped', reason: 'no_chunks' };
   }
@@ -264,7 +268,8 @@ export async function reembedPageWithContextualRetrieval(
   // fall-back path is the D14 page-level consistency guarantee: a
   // single bad chunk demotes the whole page to title-only so all
   // chunks on the page share the same wrapper shape.
-  const haikuModel = args.haikuModel ?? DEFAULT_HAIKU_MODEL;
+  const haikuModel =
+    args.haikuModel ?? DEFAULT_CONTEXTUAL_RETRIEVAL_HAIKU_MODEL;
   let attemptMode: CRMode = resolution.mode;
   let fallbackReason: SynopsisFailureKind | null = null;
 

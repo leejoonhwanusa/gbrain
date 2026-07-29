@@ -29,7 +29,11 @@ gbrain embed --stale --dry-run # preview the count without re-embedding
 
 Under federated_v2, the same drift is picked up by the per-source
 `embed-backfill` jobs that `gbrain sync --all` enqueues (capped
-`$X/source/24h`). **Grandfather:** pages embedded before v0.41.31.0
+`$X/source/24h`). As of v0.42.57.0, every successful deferred sync,
+including an explicit `--no-embed`, verifies the source's real stale
+predicate and either proves there is no work or hands it to a queued,
+active, or delayed backfill job. Use `--no-auto-embed` only when that
+automatic handoff is intentionally unwanted. **Grandfather:** pages embedded before v0.41.31.0
 carry a NULL signature and are NEVER flagged stale, so upgrading to
 v0.41.31.0 does NOT trigger a whole-corpus re-embed. Signatures only
 get stamped going forward.

@@ -54,6 +54,7 @@ import { isUndefinedColumnError } from '../core/utils.ts';
 // drift from what search actually filters.
 import { resolveHardExcludes, DEFAULT_HARD_EXCLUDES } from '../core/search/source-boost.ts';
 import { escapeLikePattern, buildVisibilityClause } from '../core/search/sql-ranking.ts';
+import { inspectContextualRetrievalState } from '../core/contextual-retrieval-drift.ts';
 
 // The built-in parser registry recognizes chat/transcript line formats, not
 // generic email documents. `email` is intentionally excluded: code repositories
@@ -943,9 +944,10 @@ export function checkSelfUpgradeHealth(): Check {
  *   1. Pages with chunker_version < current — pre-v40 pages that need
  *      to be re-embedded for the wrapper to apply. Paste-ready fix:
  *      `gbrain reindex --markdown`.
- *   2. Pages with contextual_retrieval_mode IS NULL — never evaluated
- *      against the CR ladder. Same fix as (1).
- *   3. Synopsis-failure events in the audit JSONL over the last 7 days
+ *   2. Pages whose contextual_retrieval_mode differs from the exact mode
+ *      expected by the active search bundle and source/page overrides.
+ *   3. Pages stamped with a stale contextual-retrieval corpus generation.
+ *   4. Synopsis-failure events in the audit JSONL over the last 7 days
  *      — surfaces refusals + page-level fallbacks. >5% refusal rate
  *      warns; otherwise reported as informational.
  *
@@ -956,18 +958,16 @@ export function checkSelfUpgradeHealth(): Check {
  */
 export async function checkContextualRetrievalCoverage(engine: BrainEngine): Promise<Check> {
   try {
-    const { MARKDOWN_CHUNKER_VERSION } = await import('../core/chunkers/recursive.ts');
-    const rows = await engine.executeRaw<{ chunker_drift: number; mode_null: number }>(
-      `SELECT
-         COUNT(*) FILTER (WHERE chunker_version < $1)::int AS chunker_drift,
-         COUNT(*) FILTER (WHERE contextual_retrieval_mode IS NULL)::int AS mode_null
-       FROM pages
-       WHERE page_kind = 'markdown'
-         AND deleted_at IS NULL`,
-      [MARKDOWN_CHUNKER_VERSION],
-    );
-    const chunkerDrift = rows[0]?.chunker_drift ?? 0;
-    const modeNull = rows[0]?.mode_null ?? 0;
+    const inspection = await inspectContextualRetrievalState(engine);
+    const {
+      chunkerDrift,
+      modeDrift,
+      generationDrift,
+      globalMode,
+      activeSearchMode,
+      totalMarkdownPages,
+      expectedModeCounts,
+    } = inspection;
 
     // Synopsis-failures audit summary (best-effort; missing audit file = 0).
     let failureSummaryLine = '';
@@ -985,11 +985,26 @@ export async function checkContextualRetrievalCoverage(engine: BrainEngine): Pro
       // Audit module unavailable — skip the summary line.
     }
 
-    if (chunkerDrift === 0 && modeNull === 0 && failureSummaryLine === '') {
+    if (
+      chunkerDrift === 0 &&
+      modeDrift === 0 &&
+      generationDrift === 0 &&
+      failureSummaryLine === ''
+    ) {
       return {
         name: 'contextual_retrieval_coverage',
         status: 'ok',
-        message: 'All markdown pages aligned to current chunker + CR mode.',
+        message:
+          `All ${totalMarkdownPages} markdown page(s) aligned to active ` +
+          `search.mode=${activeSearchMode}, CR mode=${globalMode}, and corpus generation.`,
+        details: {
+          active_search_mode: activeSearchMode,
+          global_cr_mode: globalMode,
+          expected_mode_counts: expectedModeCounts,
+          chunker_drift: 0,
+          mode_drift: 0,
+          generation_drift: 0,
+        },
       };
     }
 
@@ -997,17 +1012,34 @@ export async function checkContextualRetrievalCoverage(engine: BrainEngine): Pro
     if (chunkerDrift > 0) {
       parts.push(`${chunkerDrift} page(s) at older chunker_version`);
     }
-    if (modeNull > 0) {
-      parts.push(`${modeNull} page(s) never evaluated against CR ladder`);
+    if (modeDrift > 0) {
+      parts.push(
+        `${modeDrift} page(s) differ from their expected CR mode ` +
+        `(global=${globalMode}, search.mode=${activeSearchMode})`,
+      );
+    }
+    if (generationDrift > 0) {
+      parts.push(`${generationDrift} page(s) carry stale corpus_generation`);
     }
     const fixHint =
-      chunkerDrift > 0 || modeNull > 0
+      chunkerDrift > 0 || modeDrift > 0 || generationDrift > 0
         ? ` Run \`gbrain reindex --markdown\` to align.`
         : '';
+    const stateSummary = parts.length > 0
+      ? `${parts.join('; ')}.`
+      : `Contextual retrieval state aligned to search.mode=${activeSearchMode}, CR mode=${globalMode}.`;
     return {
       name: 'contextual_retrieval_coverage',
-      status: chunkerDrift > 0 || modeNull > 0 ? 'warn' : 'ok',
-      message: `${parts.join('; ')}.${fixHint}${failureSummaryLine}`,
+      status: chunkerDrift > 0 || modeDrift > 0 || generationDrift > 0 ? 'warn' : 'ok',
+      message: `${stateSummary}${fixHint}${failureSummaryLine}`,
+      details: {
+        active_search_mode: activeSearchMode,
+        global_cr_mode: globalMode,
+        expected_mode_counts: expectedModeCounts,
+        chunker_drift: chunkerDrift,
+        mode_drift: modeDrift,
+        generation_drift: generationDrift,
+      },
     };
   } catch (e) {
     return {
@@ -7516,6 +7548,10 @@ export async function buildChecks(
   if (engine !== null) {
     progress.heartbeat('search_mode');
     checks.push(await checkSearchMode(engine));
+    // v0.40.3.0 contextual_retrieval_coverage — keep the local CLI Doctor
+    // wired to the same exact drift inspector as the remote Doctor surface.
+    progress.heartbeat('contextual_retrieval_coverage');
+    checks.push(await checkContextualRetrievalCoverage(engine));
     // issue #1777 — hidden_by_search_policy: chunked pages withheld from default
     // search by the hard-exclude prefix policy (audit the surviving excludes).
     progress.heartbeat('hidden_by_search_policy');

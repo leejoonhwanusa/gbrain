@@ -26,6 +26,7 @@ import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { CHUNKER_VERSION } from '../src/core/chunkers/code.ts';
 import type { ChunkInput } from '../src/core/types.ts';
+import { LATEST_VERSION } from '../src/core/migrate.ts';
 
 /** Offline embed stub so inline-proceed paths (posture tokenmax) don't network. */
 function stubOfflineEmbed(): void {
@@ -51,6 +52,10 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  // resetPgliteState clears config rows while retaining the migrated schema.
+  // Backfill submission is now a fail-closed part of deferred sync, so keep
+  // the queue's schema-version guard aligned with the physical test schema.
+  await engine.setConfig('version', String(LATEST_VERSION));
   // Configure the gateway with a dummy key so the pre-gate embedding-creds
   // preflight passes (diagnoseEmbedding reads gateway configure-time state,
   // not live env). The gate runs before any real embed call, so no network
@@ -107,8 +112,9 @@ async function runSyncCaptured(args: string[]): Promise<{ exitCode: number | und
 describe('v0.41.31 — sync --all cost gate wiring', () => {
   test('R-1: deferred sync --all (non-TTY) emits deferred_notice and never exit 2', async () => {
     await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);
-    // Make the fan-out a clean no-op: last_commit == HEAD so performSync
-    // reports up_to_date (no git pull, no backfill submit).
+    // Make the content fan-out a clean no-op: last_commit == HEAD so
+    // performSync reports up_to_date. The stale vector backlog must still be
+    // handed to embed-backfill before the command returns.
     await engine.executeRaw(`UPDATE sources SET last_commit = $1 WHERE id = 'vault'`, [headSha]);
     // Seed a stale backlog so the deferred notice has a non-zero figure.
     await engine.putPage('vault/note', { type: 'note', title: 'note', compiled_truth: '# note' }, { sourceId: 'vault' });
@@ -124,6 +130,13 @@ describe('v0.41.31 — sync --all cost gate wiring', () => {
     // The headline assertion: NOT blocked.
     expect(exitCode).not.toBe(2);
     expect(stdout).toContain('"gate":"deferred_notice"');
+    const jobs = await engine.executeRaw<{ status: string; reason: string }>(
+      `SELECT status, data->>'reason' AS reason
+         FROM minion_jobs
+        WHERE name = 'embed-backfill' AND data->>'sourceId' = 'vault'`,
+    );
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({ status: 'waiting', reason: 'sync_all' });
   }, 60_000);
 
   test('R-2 (#2139): inline sync --all (--serial) above floor AUTO-DEFERS (exit 0, never exit 2) + enqueues backfill', async () => {
@@ -243,5 +256,36 @@ describe('v0.41.31 — sync --all cost gate wiring', () => {
     // The gate now exists on the single-source path (was ungated before
     // #2139) and proceeds to import rather than blocking.
     expect(stdout.toLowerCase()).toContain('imported');
+  }, 60_000);
+
+  test('explicit single-source --no-embed queues backfill even with federated v2 disabled', async () => {
+    await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);
+    await engine.setConfig('sync.federated_v2', 'false');
+
+    const { exitCode } = await runSyncCaptured([
+      '--source', 'vault', '--no-embed', '--json', '--no-pull',
+    ]);
+
+    expect(exitCode).not.toBe(2);
+    const jobs = await engine.executeRaw<{ status: string; reason: string }>(
+      `SELECT status, data->>'reason' AS reason
+         FROM minion_jobs
+        WHERE name = 'embed-backfill' AND data->>'sourceId' = 'vault'`,
+    );
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({ status: 'waiting', reason: 'sync_no_embed' });
+  }, 60_000);
+
+  test('explicit --no-auto-embed remains an authoritative opt-out', async () => {
+    await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);
+
+    await runSyncCaptured([
+      '--source', 'vault', '--no-embed', '--no-auto-embed', '--json', '--no-pull',
+    ]);
+
+    const jobs = await engine.executeRaw<{ count: number }>(
+      `SELECT COUNT(*)::int AS count FROM minion_jobs WHERE name = 'embed-backfill'`,
+    );
+    expect(Number(jobs[0]?.count ?? 0)).toBe(0);
   }, 60_000);
 });

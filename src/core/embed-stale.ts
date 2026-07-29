@@ -79,9 +79,13 @@ export interface EmbedStaleResult {
   chunksProcessed: number;
   /** Pages whose embeddings landed. */
   pagesProcessed: number;
+  /** Chunks that stayed stale because their page failed to embed. */
+  failedChunks: number;
+  /** Pages that failed to embed and therefore require a retry. */
+  failedPages: number;
   /** Last cursor reached. null iff zero stale chunks existed at start. */
   lastCursor: StaleCursor | null;
-  /** True iff the loop exited because every stale chunk was processed. */
+  /** True iff the loop exhausted the stale set with no page failures. */
   done: boolean;
   /** True iff the loop exited because `signal.aborted` fired. */
   aborted: boolean;
@@ -127,6 +131,8 @@ export async function embedStaleForSource(
     embedded: 0,
     chunksProcessed: 0,
     pagesProcessed: 0,
+    failedChunks: 0,
+    failedPages: 0,
     lastCursor: null,
     done: false,
     aborted: false,
@@ -159,7 +165,7 @@ export async function embedStaleForSource(
       }),
     );
     if (batch.length === 0) {
-      result.done = true;
+      result.done = result.failedChunks === 0;
       return result;
     }
 
@@ -223,6 +229,8 @@ export async function embedStaleForSource(
         // Aborted mid-fetch is expected; treat as graceful exit.
         if (signal?.aborted) return;
         // Otherwise log and skip — the chunk stays NULL and next call retries.
+        result.failedChunks += stale.length;
+        result.failedPages += 1;
         process.stderr.write(
           `\n  [embed-stale] error on ${keySourceId}/${slug}: ${
             e instanceof Error ? e.message : String(e)
@@ -258,9 +266,19 @@ export async function embedStaleForSource(
       });
     }
 
-    // Short batch = end of stale set; advance and exit.
+    // A cancellation can arrive inside the final short batch. Without this
+    // post-worker check, that path skips the next loop's abort guard and can
+    // incorrectly return done=true while chunks remain stale.
+    if (signal?.aborted) {
+      result.aborted = true;
+      return result;
+    }
+
+    // Short batch = end of this cursor walk. It is only complete when every
+    // claimed page landed. Failed pages remain NULL and must make the caller
+    // retry from the source predicate rather than report a false success.
     if (batch.length < batchSize) {
-      result.done = true;
+      result.done = result.failedChunks === 0;
       return result;
     }
   }

@@ -167,8 +167,13 @@ export async function submitEmbedBackfill(
   );
 
   if (lastJob[0]) {
-    if (lastJob[0].status === 'active' || lastJob[0].status === 'waiting') {
-      // Active or waiting: no cooldown-remaining number (would be misleading).
+    if (
+      lastJob[0].status === 'active' ||
+      lastJob[0].status === 'waiting' ||
+      lastJob[0].status === 'delayed'
+    ) {
+      // Active, waiting, or delayed-for-retry: no cooldown-remaining number
+      // (would be misleading). All three already own the pending work.
       return { status: 'cooldown' };
     }
     if (lastJob[0].finished_at) {

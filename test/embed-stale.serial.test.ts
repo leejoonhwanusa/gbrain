@@ -72,6 +72,8 @@ describe('embedStaleForSource', () => {
       embedded: 0,
       chunksProcessed: 0,
       pagesProcessed: 0,
+      failedChunks: 0,
+      failedPages: 0,
       lastCursor: null,
       done: true,
       aborted: false,
@@ -171,6 +173,26 @@ describe('embedStaleForSource', () => {
     expect(stale).toBe(0);
   });
 
+  test('IRON-RULE: abort inside the final short batch never reports done', async () => {
+    await seedPageWithStaleChunks('only', 2);
+    const controller = new AbortController();
+
+    const result = await embedStaleForSource(engine, 'default', {
+      batchSize: 10,
+      concurrency: 1,
+      signal: controller.signal,
+      embedFn: async () => {
+        controller.abort();
+        throw new Error('aborted');
+      },
+    });
+
+    expect(result.aborted).toBe(true);
+    expect(result.done).toBe(false);
+    expect(result.embedded).toBe(0);
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(2);
+  });
+
   test('per-page embedFn throw is logged but does NOT propagate', async () => {
     await seedPageWithStaleChunks('good', 2);
     await seedPageWithStaleChunks('bad', 2);
@@ -186,9 +208,11 @@ describe('embedStaleForSource', () => {
       },
     });
 
-    // The helper itself didn't throw
-    expect(result.done).toBe(true);
+    // The helper itself didn't throw, but it must not claim completion.
+    expect(result.done).toBe(false);
     expect(badCount).toBe(1);
+    expect(result.failedPages).toBe(1);
+    expect(result.failedChunks).toBe(2);
 
     // 'good' chunks got embedded; 'bad' chunks stayed NULL
     expect(result.embedded).toBe(2);

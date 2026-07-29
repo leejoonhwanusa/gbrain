@@ -77,6 +77,21 @@ describe('submitEmbedBackfill — cooldown gate', () => {
     expect(result.cooldownRemainingSeconds).toBeUndefined();
   });
 
+  test('blocks re-submission while a same-source job is delayed for retry', async () => {
+    const queue = new MinionQueue(engine);
+    const job = await queue.add('embed-backfill', { sourceId: 'default' }, {});
+    await engine.executeRaw(
+      `UPDATE minion_jobs
+          SET status='delayed', delay_until=NOW() + INTERVAL '1 minute'
+        WHERE id=$1`,
+      [job.id],
+    );
+
+    const result = await submitEmbedBackfill(engine, 'default', { reason: 'unit' });
+    expect(result.status).toBe('cooldown');
+    expect(result.cooldownRemainingSeconds).toBeUndefined();
+  });
+
   test('blocks re-submission inside the cooldown window after recent finish', async () => {
     const queue = new MinionQueue(engine);
     const job = await queue.add('embed-backfill', { sourceId: 'default' }, {});

@@ -197,6 +197,13 @@ export function makeEmbedBackfillHandler(engine: BrainEngine) {
           spentUsd: tracker.totalSpent,
         };
       }
+      if (!result.done) {
+        throw new Error(
+          `embed-backfill incomplete for source "${sourceId}": ` +
+          `${result.failedPages} page(s) / ${result.failedChunks} chunk(s) ` +
+          `remain stale after processing ${result.chunksProcessed} chunk(s)`,
+        );
+      }
       return {
         status: 'success',
         sourceId,

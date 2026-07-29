@@ -195,7 +195,10 @@ of chasing the score directly:
 4. **Embedding lag.** After sync/cycle repair, run source-scoped or global stale
    embedding catch-up. If a catch-up says another backfill is running, verify the
    `gbrain-embed-backfill:<source>` lock holder PID before starting another run;
-   do not clear a lock unless the exact holder PID is proven dead.
+   do not clear a lock unless the exact holder PID is proven dead. On v0.42.57.0
+   and later, a successful `sync --no-embed` already verifies or queues this
+   work unless `--no-auto-embed` was supplied; inspect the queued, active, or
+   delayed job before submitting another.
 5. **Graph lag and quality warnings.** Once sync and embeddings are current, run
    `gbrain extract --stale` and then address lower-priority content quality rows
    such as frontmatter warnings, graph/timeline coverage, takes, and pack upgrade
