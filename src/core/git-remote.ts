@@ -283,7 +283,7 @@ export function validateRepoState(
     return 'not-a-dir';
   }
   if (!stat.isDirectory()) return 'not-a-dir';
-  if (!existsSync(join(repoPath, '.git'))) return 'no-git';
+  if (!existsSync(join(repoPath, '.git')) && !isInsideGitRepo(repoPath)) return 'no-git';
 
   let remoteUrl: string;
   try {

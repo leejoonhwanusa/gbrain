@@ -432,4 +432,13 @@ describe('validateRepoState', () => {
       expect(validateRepoState(p)).toBe('healthy');
     });
   });
+
+  test("returns 'healthy' for a registered subdirectory inside a git repository", async () => {
+    const p = join(fixtureDir, 'repo-subdirectory', 'wiki');
+    mkdirSync(p, { recursive: true });
+    setMode('url-match');
+    await withEnv({ PATH: fakePath() }, async () => {
+      expect(validateRepoState(p, 'https://github.com/expected/url')).toBe('healthy');
+    });
+  });
 });
