@@ -1,6 +1,6 @@
 name: Release
 
-# Publishes a GitHub release for every VERSION bump that lands on master:
+# Manually publishes a GitHub release for the current VERSION:
 # tag + title `v<VERSION>`, notes from that version's CHANGELOG.md entry,
 # compiled binaries attached (#3521).
 #
@@ -20,10 +20,7 @@ name: Release
 # src/core/binary-self-update.ts, pinned by test/release-workflow.test.ts.
 
 on:
-  push:
-    branches: [master]
-    paths: [VERSION]
-  workflow_dispatch: {}  # manual first run / backfill of the current VERSION
+  workflow_dispatch: {}
 
 permissions:
   contents: read

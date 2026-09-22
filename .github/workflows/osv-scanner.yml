@@ -1,21 +1,12 @@
 name: OSV-Scanner
 
 # Dependency vulnerability scan (#2182) via Google's official reusable
-# workflow. Runs weekly and on any PR that touches the dependency manifests.
+# workflow. It is manual-only in this fork.
 # Tokenless: needs zero secrets. Findings are reported in the job log and as
 # a SARIF artifact on the run; code-scanning upload is deliberately disabled
 # so the workflow stays read-only (no security-events: write).
 
 on:
-  pull_request:
-    branches: [master]
-    paths:
-      - 'bun.lock'
-      - 'package.json'
-      - 'admin/bun.lock'
-      - 'admin/package.json'
-  schedule:
-    - cron: '30 6 * * 1'  # weekly, Monday 06:30 UTC
   workflow_dispatch:
 
 permissions:
