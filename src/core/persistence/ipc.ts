@@ -1,12 +1,14 @@
 /** Dedicated, bounded local persistence transport. Hook IPC keeps its own small frame budget. */
 import net, { type Server, type Socket } from 'node:net';
-import { chmodSync, lstatSync, unlinkSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { createHash } from 'node:crypto';
+import { chmodSync, lstatSync, realpathSync, unlinkSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { OperationError } from '../ops/contract.ts';
 import { resolveSocketPathForConfig, socketHasLiveListener } from '../context/resolve-ipc.ts';
 import { isWriteErrorCode, isWriteReceipt, isWriteRequestId, publicWriteReceipt } from './types.ts';
 import { isPersistenceAdminOperation, PERSISTENCE_ADMIN_OPERATIONS, type PersistenceAdminOperation } from './admin-contract.ts';
 import { claimLocalIpcBinding, isWindowsIpcPipe, prepareLocalIpcPath } from '../context/ipc-path.ts';
+import { windowsPipeName } from '../context/windows-ipc.ts';
 
 export const PERSISTENCE_IPC_VERSION = 1;
 // Five million content bytes can require six JSON bytes each (e.g. NUL).
@@ -85,7 +87,27 @@ export function isPersistenceIpcMutation(value: string): boolean {
 }
 
 export function persistenceSocketPathForConfig(config: Parameters<typeof resolveSocketPathForConfig>[0]): string | null {
-  return resolveSocketPathForConfig(config, 'persistence');
+  const path = resolveSocketPathForConfig(config, 'persistence');
+  return path === null ? null : persistenceTransportPath(path);
+}
+
+function persistenceTransportPath(path: string): string {
+  if (process.platform !== 'win32' || isWindowsIpcPipe(path)) return path;
+  let current = resolve(path);
+  const missing: string[] = [];
+  for (;;) {
+    try {
+      current = join(realpathSync.native(current), ...missing.reverse());
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || dirname(current) === current) throw error;
+      missing.push(basename(current));
+      current = dirname(current);
+    }
+  }
+  const identity = current.replaceAll('/', '\\');
+  const digest = createHash('sha256').update(identity).digest('hex');
+  return windowsPipeName(`\\\\.\\pipe\\gbrain-persistence-${digest}`);
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -143,6 +165,7 @@ export async function startPersistenceIpcServer(
   provider: PersistenceIpcProvider,
 ): Promise<PersistenceIpcBinding | null> {
   if (!isWriteRequestId(provider.brainId)) throw new Error('Persistence IPC requires a durable brain UUID.');
+  socketPath = persistenceTransportPath(socketPath);
   const binding = await claimLocalIpcBinding(socketPath);
   if (!binding) return null;
   socketPath = binding.socketPath;
@@ -284,7 +307,7 @@ function remoteOperationError(value: unknown): OperationError {
 /** One bounded exchange. No automatic reconnect or replay after any request bytes are sent. */
 async function exchange(socketPath: string, request: unknown, timeoutMs: number, requestId?: string): Promise<unknown> {
   const frame = responseFrame(request);
-  try { socketPath = prepareLocalIpcPath(socketPath); }
+  try { socketPath = prepareLocalIpcPath(persistenceTransportPath(socketPath)); }
   catch { throw new PersistenceIpcTransportError(false, requestId); }
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath);

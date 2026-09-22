@@ -9,6 +9,23 @@
 # (test/scripts/run-unit-parallel.test.ts symlinks a minimal PATH with no
 # sysctl/nproc/vm_stat/timeout and no package.json).
 
+# `bun run` starts a non-login Git Bash on Windows and preserves the host PATH,
+# so System32 can win for names such as timeout, find and sort. Runners that
+# require POSIX contracts call this before resolving their tools. A curated
+# sandbox PATH without `uname` remains untouched.
+prefer_posix_test_tools() {
+  case "$(uname -s 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*)
+      # Preserve a runner's selected Bun/shim directory ahead of Git tools;
+      # hermetic harnesses place all of their command doubles beside `bun`.
+      local bun_bin=""
+      bun_bin="$(command -v bun 2>/dev/null || true)"
+      [ -n "$bun_bin" ] && PATH="$(dirname "$bun_bin"):/usr/bin:/bin:$PATH" || PATH="/usr/bin:/bin:$PATH"
+      export PATH
+      ;;
+  esac
+}
+
 # ──────────────────────────────────────────────────────────────────────────
 # CPU detection: Apple Silicon perf cores → Mac total physical → nproc → 4.
 # Returns a single positive integer.

@@ -79,6 +79,7 @@ cd "$(dirname "$0")/.."
 # shared lib (also sourced by test-shard.sh, run-serial-tests.sh,
 # run-slow-tests.sh) — one implementation, no copy drift.
 . scripts/lib/test-env.sh
+prefer_posix_test_tools
 ensure_pglite_snapshot "run-unit-parallel"
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -203,13 +204,19 @@ rm -f "$LOG_DIR"/shard-*.log "$LOG_DIR"/shard-*.exit "$LOG_DIR"/shard-*.wedged "
 : > "$SUMMARY_FILE"
 
 # ──────────────────────────────────────────────────────────────────────────
-# Resolve `timeout` command. macOS without coreutils has neither; we degrade
-# to bg-pid + sleep cap. For now, prefer gtimeout (brew coreutils) → timeout.
+# Resolve a compatible GNU-style `timeout` command. macOS without coreutils
+# has neither; Windows may expose the incompatible System32 utility under the
+# same basename. Degrade to bg-pid + sleep cap when no candidate proves the
+# signal/kill-after contract this runner uses.
 # ──────────────────────────────────────────────────────────────────────────
 TIMEOUT_BIN=""
-if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"
-elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
-fi
+for candidate in gtimeout timeout /usr/bin/timeout /bin/timeout; do
+  resolved="$(command -v "$candidate" 2>/dev/null || true)"
+  if [ -n "$resolved" ] && "$resolved" --signal=TERM --kill-after=1s 1s sh -c ':' >/dev/null 2>&1; then
+    TIMEOUT_BIN="$resolved"
+    break
+  fi
+done
 
 START_TS=$(date +%s)
 echo "[unit-parallel] N=$N shards | --max-concurrency=$INTRA_CONC | timeout=${SHARD_TIMEOUT}s | kill-after=${SHARD_KILL_AFTER}s | logs=$LOG_DIR${MEM_NOTE}" >&2

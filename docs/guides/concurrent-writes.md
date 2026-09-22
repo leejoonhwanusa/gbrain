@@ -86,6 +86,12 @@ database. The directory must belong to the current OS user with mode `0700`;
 clients require a socket with mode `0600`. Unsafe entries are refused. Existing
 credentials and hook-secret locations are unchanged. A native binding lock
 serializes startup and remains held until the listener has actually closed.
+On Windows, the dedicated persistence transport resolves the discovery path's
+physical identity before deriving a deterministic private named pipe, so path
+case and junction aliases reach the same owner. It retains the native Global
+mutex through actual close and does not publish a filesystem AF_UNIX reparse
+point, avoiding runtime-specific stale socket artifacts while preserving the
+same local-only owner election and client discovery contract.
 
 
 Admission retries confirmed database lock/serialization aborts for up to five

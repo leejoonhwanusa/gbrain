@@ -21,7 +21,7 @@ const rawServers: Server[] = [];
 function socketPath() {
   const dir = mkdtempSync(join(tmpdir(), 'gb-write-ipc-'));
   dirs.push(dir);
-  return join(dir, 'write.sock');
+  return persistenceSocketPathForConfig({ engine: 'pglite', database_path: dir })!;
 }
 
 function request(params: Record<string, unknown> = {}): PersistenceIpcRequest {
@@ -70,7 +70,9 @@ describe('dedicated persistence IPC', () => {
     expect(capabilities.operations).toContain('fetch');
     expect(capabilities.max_frame_bytes).toBe(PERSISTENCE_IPC_MAX_BYTES);
     if (process.platform !== 'win32') expect(statSync(path).mode & 0o777).toBe(0o600);
-    expect(persistenceSocketPathForConfig({ engine: 'pglite', database_path: tmpdir() })).toBe(join(tmpdir(), '.gbrain-persistence.sock'));
+    const discovered = persistenceSocketPathForConfig({ engine: 'pglite', database_path: tmpdir() });
+    if (process.platform === 'win32') expect(discovered).toStartWith('\\\\.\\pipe\\gbrain-persistence-');
+    else expect(discovered).toBe(join(tmpdir(), '.gbrain-persistence.sock'));
   });
 
   test('preserves explicit source, client cwd, principal credential, and request ID', async () => {
@@ -196,7 +198,7 @@ describe('dedicated persistence IPC', () => {
     expect(await requestPersistenceOperation(path, request())).toEqual({ owner: 'next' });
   });
 
-  test('ordinary files at the discovery path are never removed', async () => {
+  test.skipIf(process.platform === 'win32')('ordinary files at the discovery path are never removed', async () => {
     const path = socketPath();
     writeFileSync(path, 'keep');
     await expect(startPersistenceIpcServer(path, { brainId: BRAIN, dispatch: async () => ({}) })).rejects.toThrow('not a socket');

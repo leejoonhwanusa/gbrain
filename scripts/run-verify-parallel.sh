@@ -30,6 +30,7 @@ cd "$(dirname "$0")/.."
 # detect_cpus + ensure_pglite_snapshot (the PGLite-booting eval checks use
 # the snapshot fast-path when the shape matches).
 . scripts/lib/test-env.sh
+prefer_posix_test_tools
 
 # ──────────────────────────────────────────────────────────────────────────
 # Checks to run. Each entry is a bun-script name (the `package.json`
@@ -157,13 +158,19 @@ else
   trap 'rm -rf "$LOG_DIR"' EXIT
 fi
 
-# Resolve `timeout` for per-check wallclock cap. macOS doesn't ship one;
-# brew coreutils provides `gtimeout`. If neither is available, fall back to
+# Resolve a compatible `timeout` for the per-check wallclock cap. A Windows
+# host may expose System32/timeout.exe ahead of Git coreutils; verify the
+# command contract instead of trusting the basename. macOS doesn't ship one,
+# so brew coreutils provides `gtimeout`. If neither is available, fall back to
 # bg-pid + sleep-cap (slightly less reliable but still bounded).
 TIMEOUT_BIN=""
-if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"
-elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
-fi
+for candidate in gtimeout timeout /usr/bin/timeout /bin/timeout; do
+  resolved="$(command -v "$candidate" 2>/dev/null || true)"
+  if [ -n "$resolved" ] && "$resolved" 1 sh -c ':' >/dev/null 2>&1; then
+    TIMEOUT_BIN="$resolved"
+    break
+  fi
+done
 
 # Bounded worker pool. Unbounded fan-out ran two `cp -R src` +
 # `bun build --compile` builds, the admin vite build, tsc, and ~40 greps

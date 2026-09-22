@@ -231,7 +231,7 @@ test('plain local paths elect one listener and retain native exclusion through a
   expect(pair.filter(Boolean)).toHaveLength(1);
   const first = pair.find(Boolean)!; const server = track(first.server);
   const accepted = once(server, 'connection');
-  const socket = await connect(path); const [peer] = await accepted; sockets.add(peer);
+  const socket = await connect(first.socketPath); const [peer] = await accepted; sockets.add(peer);
   const closed = new Promise<void>(done => server.once('close', done));
   server.close();
   expect(await startPersistenceIpcServer(path, { brainId: BRAIN, dispatch: async () => ({}) })).toBeNull();
@@ -252,6 +252,13 @@ test.skipIf(process.platform !== 'win32')('Windows named pipes elect one actual 
   const closed = once(first.server, 'close'); first.close(); await closed;
   track((await startPersistenceIpcServer(path, { brainId: BRAIN, dispatch: async () => ({}) }))?.server ?? null);
   expect((await requestPersistenceCapabilities(path)).brain_id).toBe(BRAIN);
+  const databasePath = temporary();
+  const aliasRoot = temporary();
+  const junction = join(aliasRoot, 'database-alias');
+  symlinkSync(databasePath, junction, 'junction');
+  const direct = persistenceSocketPathForConfig({ engine: 'pglite', database_path: databasePath });
+  expect(persistenceSocketPathForConfig({ engine: 'pglite', database_path: databasePath.toUpperCase() })).toBe(direct);
+  expect(persistenceSocketPathForConfig({ engine: 'pglite', database_path: junction })).toBe(direct);
 });
 
 describe.skipIf(process.platform !== 'win32')('Windows native IPC ownership', () => {
