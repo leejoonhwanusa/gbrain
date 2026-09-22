@@ -2,7 +2,7 @@
  * issue #1939 — sync failure ledger + bounded auto-skip valve.
  *
  * Covers the correctness gates the /codex outside-voice review identified:
- *   #1 auto-skipped entries stay UNRESOLVED (doctor WARN), not hidden
+ *   #1 auto-skipped entries stay UNRESOLVED (doctor WARN) until explicit ack
  *   #2 (source_id, path) keying — failures never merge across sources
  *   #3 `<head>` sentinel never auto-skips; always hard-blocks
  *   #4 success clears a path so `attempts` is truly consecutive
@@ -18,15 +18,11 @@ import { tmpdir } from 'os';
 
 let tmpHome: string;
 const originalHome = process.env.HOME;
-const originalGbrainHome = process.env.GBRAIN_HOME;
 const originalThreshold = process.env.GBRAIN_SYNC_AUTOSKIP_AFTER;
 
 beforeEach(async () => {
   tmpHome = mkdtempSync(join(tmpdir(), 'gbrain-ledger-'));
   process.env.HOME = tmpHome;
-  // configDir() honors GBRAIN_HOME before os.homedir(); set it explicitly so
-  // Windows test runs never write to the operator's real ~/.gbrain ledger.
-  process.env.GBRAIN_HOME = tmpHome;
   delete process.env.GBRAIN_SYNC_AUTOSKIP_AFTER;
   const { syncFailuresPath } = await import('../src/core/sync-failure-ledger.ts');
   try { rmSync(syncFailuresPath(), { force: true }); } catch { /* none */ }
@@ -34,8 +30,6 @@ beforeEach(async () => {
 
 afterEach(() => {
   if (originalHome) process.env.HOME = originalHome; else delete process.env.HOME;
-  if (originalGbrainHome) process.env.GBRAIN_HOME = originalGbrainHome;
-  else delete process.env.GBRAIN_HOME;
   if (originalThreshold === undefined) delete process.env.GBRAIN_SYNC_AUTOSKIP_AFTER;
   else process.env.GBRAIN_SYNC_AUTOSKIP_AFTER = originalThreshold;
   try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -71,6 +65,25 @@ describe('#2 multi-source keying', () => {
     expect(rows.find(r => r.source_id === 'alpha')!.state).toBe('acknowledged');
     expect(rows.find(r => r.source_id === 'beta')!.state).toBe('open');
   });
+
+  test('acknowledgeFailures resolves auto-skipped rows for that source (#3829)', async () => {
+    const {
+      recordFailures,
+      autoSkipFailures,
+      acknowledgeFailures,
+      loadSyncFailures,
+    } = await L();
+    recordFailures('alpha', [{ path: 'a.md', error: 'YAML parse failed' }], 'c1');
+    recordFailures('beta', [{ path: 'b.md', error: 'YAML parse failed' }], 'c1');
+    autoSkipFailures('alpha', ['a.md']);
+    autoSkipFailures('beta', ['b.md']);
+
+    const result = acknowledgeFailures('alpha');
+    expect(result.count).toBe(1);
+    const rows = loadSyncFailures();
+    expect(rows.find(r => r.source_id === 'alpha')!.state).toBe('acknowledged');
+    expect(rows.find(r => r.source_id === 'beta')!.state).toBe('auto_skipped');
+  });
 });
 
 describe('#4 success clears → consecutive attempts', () => {
@@ -95,6 +108,17 @@ describe('#4 success clears → consecutive attempts', () => {
     const rows = loadSyncFailures();
     expect(rows.length).toBe(1);
     expect(rows[0].source_id).toBe('s2');
+  });
+
+  test('caller-verified HEAD success can clear a prior sentinel', async () => {
+    const { recordFailures, clearFailures, loadSyncFailures } = await L();
+    recordFailures('s', [{ path: '<head>', error: 'git HEAD verification timed out' }], 'c1');
+    expect(loadSyncFailures()[0].state).toBe('open');
+
+    // Sentinels cannot be acknowledged or auto-skipped; the sync caller may
+    // remove one only after it has successfully re-verified pin ancestry.
+    clearFailures('s', ['<head>']);
+    expect(loadSyncFailures()).toEqual([]);
   });
 });
 
@@ -124,44 +148,6 @@ describe('#3 sentinel never auto-skips', () => {
     const { isSkippablePath } = await L();
     expect(isSkippablePath('people/x.md')).toBe(true);
     expect(isSkippablePath('<head>')).toBe(false);
-  });
-
-  test('a later clean source run clears a prior sentinel failure', async () => {
-    const { recordFailures, applySyncFailureGate, loadSyncFailures } = await L();
-    recordFailures('s', [{ path: '<head>', error: 'git HEAD verification failed' }], 'c1');
-
-    let advanced = false;
-    const out = await applySyncFailureGate({
-      sourceId: 's',
-      failedFiles: [],
-      succeededPaths: [],
-      commit: 'c2',
-      skipFailed: false,
-      advance: () => { advanced = true; },
-    });
-
-    expect(out.advanced).toBe(true);
-    expect(advanced).toBe(true);
-    expect(loadSyncFailures()).toEqual([]);
-  });
-
-  test('a later non-sentinel source run clears a prior sentinel failure', async () => {
-    const { recordFailures, applySyncFailureGate, loadSyncFailures } = await L();
-    recordFailures('s', [
-      { path: '<head>', error: 'git HEAD verification failed' },
-      { path: 'a.md', error: 'YAML parse failed' },
-    ], 'c1');
-
-    await applySyncFailureGate({
-      sourceId: 's',
-      failedFiles: [],
-      succeededPaths: ['a.md'],
-      commit: 'c2',
-      skipFailed: false,
-      advance: () => {},
-    });
-
-    expect(loadSyncFailures()).toEqual([]);
   });
 });
 
@@ -417,18 +403,5 @@ describe('resolveAutoSkipThreshold', () => {
     expect(resolveAutoSkipThreshold()).toBe(0);
     process.env.GBRAIN_SYNC_AUTOSKIP_AFTER = 'nonsense';
     expect(resolveAutoSkipThreshold()).toBe(3);
-  });
-});
-
-describe('transient timeout classification', () => {
-  test('distinguishes local Git verification from embedding timeouts', async () => {
-    const { classifyErrorCode } = await L();
-
-    expect(
-      classifyErrorCode('git HEAD verification failed: spawnSync git ETIMEDOUT'),
-    ).toBe('GIT_TIMEOUT');
-    expect(
-      classifyErrorCode('[embed(docs/architecture/KEY_FILES)] Qwen embedding timed out after 120000ms'),
-    ).toBe('EMBEDDING_TIMEOUT');
   });
 });

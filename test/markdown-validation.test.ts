@@ -51,8 +51,34 @@ describe('parseMarkdown validation surface', () => {
       expect(e).toBeDefined();
     });
 
-    test('YAML comments that look like markdown headings are not body headings', () => {
-      const md = `${fence}\ntype: concept\ntitle: hi\n# a YAML comment inside frontmatter\n${fence}\n\n# Body heading`;
+    test('YAML # comment at top of closed frontmatter does NOT trigger MISSING_CLOSE', () => {
+      // Real-world repro: research-note templates often lead with `#` comment
+      // lines as YAML comments inside the fence. The parser previously read
+      // these as markdown H1s and false-positived MISSING_CLOSE even when the
+      // closing `---` was present.
+      const md = `${fence}
+# Research Template
+# This file serves as a template for all research findings
+
+research_id: "R19"
+title: "iOS App Clip security limitations"
+${fence}
+
+body`;
+      const parsed = parseMarkdown(md, undefined, { validate: true });
+      expect(parsed.errors!.map(e => e.code)).not.toContain('MISSING_CLOSE');
+    });
+
+    test('YAML # comments interleaved with keys do NOT trigger MISSING_CLOSE', () => {
+      const md = `${fence}
+type: concept
+# section: identifiers
+research_id: "R19"
+# section: routing
+slug: research/r19
+${fence}
+
+body`;
       const parsed = parseMarkdown(md, undefined, { validate: true });
       expect(parsed.errors!.map(e => e.code)).not.toContain('MISSING_CLOSE');
     });

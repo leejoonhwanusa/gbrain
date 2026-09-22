@@ -1,8 +1,9 @@
-import { existsSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, type Dirent } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'path';
 import { RESOLVER_FILENAMES, hasResolverFile } from './resolver-filenames.ts';
 import { isPathContained } from './path-confine.ts';
+import { parseSkillFrontmatter } from './skill-frontmatter.ts';
 
 /**
  * Walk up from `startDir` looking for a `skills/` directory that
@@ -22,6 +23,43 @@ export function findRepoRoot(startDir: string = process.cwd()): string | null {
     dir = parent;
   }
   return null;
+}
+
+/**
+ * True when `dir` is a usable trigger-only skills catalog. Frontmatter
+ * `triggers:` are the canonical routing surface for modern skillpacks, so an
+ * explicit operator override must not require RESOLVER.md / AGENTS.md.
+ */
+function hasFrontmatterTriggerSkill(dir: string): boolean {
+  if (!existsSync(dir)) return false;
+
+  let dirents: Dirent[];
+  try {
+    dirents = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+
+  for (const dirent of dirents) {
+    if (!dirent.isDirectory()) continue;
+    const name = dirent.name;
+    if (name.startsWith('_') || name.startsWith('.')) continue;
+    if (name.includes('/') || name.includes('\\')) continue;
+
+    // Directory names come from readdirSync(dir), are separator-checked above,
+    // and are confined to explicit operator-selected skills catalogs.
+    const skillPath = join(dir, name, 'SKILL.md'); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    if (!existsSync(skillPath)) continue;
+
+    try {
+      const parsed = parseSkillFrontmatter(readFileSync(skillPath, 'utf-8'));
+      if (parsed?.triggers && parsed.triggers.length > 0) return true;
+    } catch {
+      continue;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -126,7 +164,8 @@ export function autoDetectSkillsDir(
   if (env.GBRAIN_SKILLS_DIR) {
     const explicit = isAbsolute(env.GBRAIN_SKILLS_DIR)
       ? env.GBRAIN_SKILLS_DIR
-      : resolvePath(startDir, env.GBRAIN_SKILLS_DIR);
+      // GBRAIN_SKILLS_DIR is an explicit operator override for local skills discovery.
+      : resolvePath(startDir, env.GBRAIN_SKILLS_DIR); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     if (hasResolverFile(explicit)) {
       return { dir: explicit, source: 'env_explicit' };
     }
@@ -214,26 +253,14 @@ function isGbrainRepoRoot(dir: string): boolean {
   );
 }
 
-/**
- * Resolve a source checkout from a compiled executable path.
- *
- * Bun-compiled binaries expose a virtual import.meta.url, so the normal
- * install-module walk cannot reach on-disk skills. A repository binary lives
- * under `<checkout>/bin`; a global Bun binary commonly lives under
- * `<home>/.bun/bin` with the checkout at `<home>/gbrain`. Walk only the
- * executable's ancestors and those ancestors' exact `gbrain/` child, gated by
- * the full repository shape and symlink-safe containment.
- */
+/** Resolve the source checkout associated with a compiled executable path. */
 export function findGbrainSourceRootFromExecPath(execPath: string): string | null {
   let dir = dirname(resolvePath(execPath));
   for (let i = 0; i < 12; i++) {
     if (isGbrainRepoRoot(dir)) return dir;
 
     const siblingCheckout = join(dir, 'gbrain');
-    if (
-      isGbrainRepoRoot(siblingCheckout) &&
-      isPathContained(siblingCheckout, dir)
-    ) {
+    if (isGbrainRepoRoot(siblingCheckout) && isPathContained(siblingCheckout, dir)) {
       return siblingCheckout;
     }
 
@@ -275,8 +302,20 @@ export function autoDetectSkillsDirReadOnly(
   env: NodeJS.ProcessEnv = process.env,
   runtime: ReadOnlyRuntimeHints = {},
 ): SkillsDirDetection {
+  if (env.GBRAIN_SKILLS_DIR) {
+    const explicit = isAbsolute(env.GBRAIN_SKILLS_DIR)
+      ? env.GBRAIN_SKILLS_DIR
+      // GBRAIN_SKILLS_DIR is an explicit operator override for local skills discovery.
+      : resolvePath(startDir, env.GBRAIN_SKILLS_DIR); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    if (hasResolverFile(explicit) || hasFrontmatterTriggerSkill(explicit)) {
+      return { dir: explicit, source: 'env_explicit' };
+    }
+    return { dir: null, source: 'env_explicit' };
+  }
+
   const primary = autoDetectSkillsDir(startDir, env);
   if (primary.dir) return primary;
+  if (primary.source === 'env_explicit') return primary;
 
   // Tier-5 install-path fallback: walk up from this module's install
   // location. Gate with isGbrainRepoRoot so we don't false-positive when
@@ -297,13 +336,15 @@ export function autoDetectSkillsDirReadOnly(
     // refuse the fallback than to fabricate a path.
   }
 
-  // Bun --compile uses a virtual module URL. Fall back to the executable's
-  // on-disk location and a strictly-shaped sibling checkout (for example
-  // ~/.bun/bin/gbrain + ~/gbrain). This remains read-only and cannot retarget
-  // skillpack/scaffold write paths because they use autoDetectSkillsDir().
+  // Bun --compile exposes a virtual module URL. Resolve the executable's
+  // strictly-shaped checkout (for example ~/.bun/bin/gbrain + ~/gbrain)
+  // for read-only callers without retargeting write paths.
   const execRoot = findGbrainSourceRootFromExecPath(runtime.execPath ?? process.execPath);
   if (execRoot) {
-    return { dir: join(execRoot, 'skills'), source: 'install_path' };
+    const skillsDir = join(execRoot, 'skills');
+    if (isPathContained(skillsDir, execRoot)) {
+      return { dir: skillsDir, source: 'install_path' };
+    }
   }
 
   return primary; // null detection, source: null

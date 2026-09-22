@@ -19,6 +19,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   isTrustedDotfile, isPathContained, realpathOrResolve, isWriteTargetContained,
+  resolvedPrefixContained, msysToNativePath,
 } from '../src/core/path-confine.ts';
 import { validateSlug } from '../src/core/utils.ts';
 import { resolveSourceId } from '../src/core/source-resolver.ts';
@@ -122,11 +123,27 @@ describe('isPathContained', () => {
     mkdirSync(sub);
     expect(isPathContained(sub, dir)).toBe(true);
   });
+  test('containment uses the OS separator, not a hardcoded "/"', () => {
+    // The boundary check appended '/' unconditionally. realpathSync returns
+    // backslash paths on Windows, so no real child ever matched the
+    // 'C:\\...\\parent/' prefix and every containment check returned false —
+    // which made the skills-dir auto-detector miss a skills/ directory that
+    // was present. Exercised through the public API with OS-native paths.
+    const dir = scratch();
+    const nested = join(dir, 'a', 'b');
+    mkdirSync(nested, { recursive: true });
+    expect(isPathContained(nested, dir)).toBe(true);
+    expect(isPathContained(nested, join(dir, 'a'))).toBe(true);
+    // The separator must remain a real boundary, not a bare string prefix.
+    const sibling = join(dir, 'a-sibling');
+    mkdirSync(sibling);
+    expect(isPathContained(sibling, join(dir, 'a'))).toBe(false);
+  });
   test('symlink escaping the parent is NOT contained', () => {
     const dir = scratch();
     const outside = scratch('pc-outside-');
     const link = join(dir, 'escape');
-    symlinkSync(outside, link, 'junction');
+    symlinkSync(outside, link);
     expect(isPathContained(link, dir)).toBe(false);
   });
   test('symlink resolving INSIDE the parent IS contained', () => {
@@ -134,7 +151,7 @@ describe('isPathContained', () => {
     const real = join(dir, 'real');
     mkdirSync(real);
     const link = join(dir, 'inlink');
-    symlinkSync(real, link, 'junction');
+    symlinkSync(real, link);
     expect(isPathContained(link, dir)).toBe(true);
   });
   test('missing path → not contained (fail-closed)', () => {
@@ -153,7 +170,7 @@ describe('realpathOrResolve', () => {
   test('resolves a symlink to its real target', () => {
     const dir = scratch();
     const real = join(dir, 'real'); mkdirSync(real);
-    const link = join(dir, 'link'); symlinkSync(real, link, 'junction');
+    const link = join(dir, 'link'); symlinkSync(real, link);
     expect(realpathOrResolve(link)).toBe(realpathOrResolve(real));
   });
   test('nonexistent path → lexical resolve (does not throw)', () => {
@@ -212,14 +229,14 @@ describe('isWriteTargetContained', () => {
     if (typeof process.getuid !== 'function') return;
     const root = scratch();
     const outside = scratch('wt-outside-');
-    symlinkSync(outside, join(root, 'link'), 'junction'); // root/link → outside
+    symlinkSync(outside, join(root, 'link')); // root/link → outside
     // target lands under the escaping symlink → real path is outside root
     expect(isWriteTargetContained(join(root, 'link', 'page.md'), root)).toBe(false);
   });
   test('a symlinked intermediate dir staying inside the root is allowed', () => {
     const root = scratch();
     mkdirSync(join(root, 'real'));
-    symlinkSync(join(root, 'real'), join(root, 'link'), 'junction');
+    symlinkSync(join(root, 'real'), join(root, 'link'));
     expect(isWriteTargetContained(join(root, 'link', 'page.md'), root)).toBe(true);
   });
 });
@@ -283,7 +300,7 @@ describe('autoDetectSkillsDir — skills/ symlink confinement', () => {
     if (typeof process.getuid !== 'function') return;
     const ws = scratch('ws-'); const outside = scratch('outside-');
     seedSkills(outside); // real skills with RESOLVER.md, OUTSIDE the workspace
-    symlinkSync(join(outside, 'skills'), join(ws, 'skills'), 'junction'); // ws/skills → outside/skills
+    symlinkSync(join(outside, 'skills'), join(ws, 'skills')); // ws/skills → outside/skills
     const found = autoDetectSkillsDir(scratch('cwd-'), { OPENCLAW_WORKSPACE: ws });
     expect(found.source).not.toBe('openclaw_workspace_env');
     expect(found.dir).not.toBe(join(ws, 'skills'));
@@ -293,7 +310,7 @@ describe('autoDetectSkillsDir — skills/ symlink confinement', () => {
     const ws = scratch('ws-');
     mkdirSync(join(ws, '_real'), { recursive: true });
     writeFileSync(join(ws, '_real', 'RESOLVER.md'), '# RESOLVER\n');
-    symlinkSync(join(ws, '_real'), join(ws, 'skills'), 'junction'); // contained symlink
+    symlinkSync(join(ws, '_real'), join(ws, 'skills')); // contained symlink
     const found = autoDetectSkillsDir(scratch('cwd-'), { OPENCLAW_WORKSPACE: ws });
     expect(found.source).toBe('openclaw_workspace_env');
     expect(found.dir).toBe(join(ws, 'skills'));
@@ -303,7 +320,7 @@ describe('autoDetectSkillsDir — skills/ symlink confinement', () => {
     if (typeof process.getuid !== 'function') return;
     const ws = scratch('ws-'); const outside = scratch('outside-');
     mkdirSync(join(outside, 'skills'), { recursive: true });
-    symlinkSync(join(outside, 'skills'), join(ws, 'skills'), 'junction');
+    symlinkSync(join(outside, 'skills'), join(ws, 'skills'));
     const found = autoDetectSkillsDir(ws, {});
     expect(found.dir).toBeNull();
   });
@@ -311,9 +328,95 @@ describe('autoDetectSkillsDir — skills/ symlink confinement', () => {
   test('cwd_walk_up: in-workspace skills symlink is allowed', () => {
     const ws = scratch('ws-');
     mkdirSync(join(ws, '_real'), { recursive: true });
-    symlinkSync(join(ws, '_real'), join(ws, 'skills'), 'junction');
+    symlinkSync(join(ws, '_real'), join(ws, 'skills'));
     const found = autoDetectSkillsDir(ws, {});
     expect(found.source).toBe('cwd_walk_up');
     expect(found.dir).toBe(join(ws, 'skills'));
+  });
+});
+
+// gbrain#4103 — win32 shapes for the pure prefix core, runnable on POSIX CI
+// (no Windows runner exists; realpathSync can never produce backslash paths
+// here, so the extracted resolvedPrefixContained is the testable seam).
+describe('resolvedPrefixContained — win32 shapes (gbrain#4103)', () => {
+  const BS = '\\';
+
+  test('backslash subtree is contained (the exact pre-fix regression)', () => {
+    // Pre-fix, a hardcoded "/" suffix made this false for EVERY real
+    // Windows subdirectory.
+    expect(resolvedPrefixContained('C:\\brain\\pages\\note.md', 'C:\\brain', BS)).toBe(true);
+    expect(resolvedPrefixContained('C:\\brain', 'C:\\brain', BS)).toBe(true);
+  });
+
+  test('sibling-prefix directories do not leak (C:\\brain vs C:\\brainstorm)', () => {
+    expect(resolvedPrefixContained('C:\\brainstorm\\x.md', 'C:\\brain', BS)).toBe(false);
+  });
+
+  test('drive-letter boundaries hold', () => {
+    expect(resolvedPrefixContained('D:\\brain\\x.md', 'C:\\brain', BS)).toBe(false);
+  });
+
+  test('UNC shares: contained subtree true, sibling share false', () => {
+    expect(resolvedPrefixContained('\\\\server\\share\\brain\\a.md', '\\\\server\\share\\brain', BS)).toBe(true);
+    expect(resolvedPrefixContained('\\\\server\\share2\\brain\\a.md', '\\\\server\\share\\brain', BS)).toBe(false);
+  });
+
+  test('POSIX shapes still hold through the same core', () => {
+    expect(resolvedPrefixContained('/brain/pages/a.md', '/brain', '/')).toBe(true);
+    expect(resolvedPrefixContained('/brainstorm/a.md', '/brain', '/')).toBe(false);
+  });
+});
+
+// ── msysToNativePath — gbrain#2955 (Git Bash / MSYS local_path healing) ─────
+//
+// On Windows, a `sources add --path` run from Git Bash / MSYS records an
+// msys-style local_path like `/c/Users/Tiger/Vault`. Later,
+// `path.win32.resolve('C:\\cwd', '/c/Users/Tiger/Vault')` joins it as
+// `C:\c\Users\Tiger\Vault` — a phantom path that never exists, so every
+// write-through / sync silently misses the real vault. The helper is a pure
+// function taking `platform` explicitly so the win32 branch is testable on
+// POSIX CI (same pattern as resolvedPrefixContained above).
+
+describe('msysToNativePath — gbrain#2955', () => {
+  test('win32: /c/… → C:\\… (the exact phantom-path shape)', () => {
+    expect(msysToNativePath('/c/Users/Tiger/Vault', 'win32')).toBe('C:\\Users\\Tiger\\Vault');
+  });
+
+  test('win32: /cygdrive/c/… → C:\\…', () => {
+    expect(msysToNativePath('/cygdrive/c/Users/Tiger/Vault', 'win32')).toBe('C:\\Users\\Tiger\\Vault');
+  });
+
+  test('win32: other drive letters, uppercased', () => {
+    expect(msysToNativePath('/d/repo', 'win32')).toBe('D:\\repo');
+    expect(msysToNativePath('/D/repo', 'win32')).toBe('D:\\repo');
+  });
+
+  test('win32: bare drive root /c → C:\\', () => {
+    expect(msysToNativePath('/c', 'win32')).toBe('C:\\');
+    expect(msysToNativePath('/cygdrive/c', 'win32')).toBe('C:\\');
+  });
+
+  test('win32: already-native paths are identity', () => {
+    expect(msysToNativePath('C:\\Users\\Tiger\\Vault', 'win32')).toBe('C:\\Users\\Tiger\\Vault');
+    expect(msysToNativePath('C:/Users/Tiger/Vault', 'win32')).toBe('C:/Users/Tiger/Vault');
+    expect(msysToNativePath('\\\\server\\share\\brain', 'win32')).toBe('\\\\server\\share\\brain');
+  });
+
+  test('win32: non-drive absolute paths are identity (no false conversion)', () => {
+    expect(msysToNativePath('/foo/bar', 'win32')).toBe('/foo/bar');
+    expect(msysToNativePath('/cygdrive/notadrive/x', 'win32')).toBe('/cygdrive/notadrive/x');
+    expect(msysToNativePath('relative/path', 'win32')).toBe('relative/path');
+    expect(msysToNativePath('', 'win32')).toBe('');
+  });
+
+  test('POSIX platforms: pure identity — /c/… is a legitimate directory there', () => {
+    expect(msysToNativePath('/c/Users/Tiger/Vault', 'linux')).toBe('/c/Users/Tiger/Vault');
+    expect(msysToNativePath('/cygdrive/c/x', 'darwin')).toBe('/cygdrive/c/x');
+  });
+
+  test('default platform is process.platform (identity on POSIX CI)', () => {
+    if (process.platform !== 'win32') {
+      expect(msysToNativePath('/c/Users/Tiger/Vault')).toBe('/c/Users/Tiger/Vault');
+    }
   });
 });

@@ -11,10 +11,6 @@ import * as os from 'node:os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { checkContextualRetrievalCoverage } from '../src/commands/doctor.ts';
 import { MARKDOWN_CHUNKER_VERSION } from '../src/core/chunkers/recursive.ts';
-import {
-  computeCorpusGeneration,
-  DEFAULT_CONTEXTUAL_RETRIEVAL_HAIKU_MODEL,
-} from '../src/core/contextual-retrieval-service.ts';
 
 let engine: PGLiteEngine;
 let tmpDir: string;
@@ -42,12 +38,6 @@ beforeEach(async () => {
   for (const f of fs.readdirSync(tmpDir)) {
     fs.unlinkSync(path.join(tmpDir, f));
   }
-  await engine.setConfig('search.mode', 'balanced');
-});
-
-const titleGeneration = () => computeCorpusGeneration({
-  crMode: 'title',
-  haikuModel: DEFAULT_CONTEXTUAL_RETRIEVAL_HAIKU_MODEL,
 });
 
 describe('contextual_retrieval_coverage doctor check', () => {
@@ -60,9 +50,9 @@ describe('contextual_retrieval_coverage doctor check', () => {
   test('fully aligned brain reports ok', async () => {
     // Insert a page at current chunker version with mode stamped.
     await engine.executeRaw(
-      `INSERT INTO pages (source_id, slug, type, title, compiled_truth, chunker_version, contextual_retrieval_mode, corpus_generation)
-       VALUES ('default', $1, 'concept', 'Aligned', 'body', $2, 'title', $3)`,
-      ['test/aligned', MARKDOWN_CHUNKER_VERSION, titleGeneration()],
+      `INSERT INTO pages (source_id, slug, type, title, compiled_truth, chunker_version, contextual_retrieval_mode)
+       VALUES ('default', $1, 'concept', 'Aligned', 'body', $2, 'title')`,
+      ['test/aligned', MARKDOWN_CHUNKER_VERSION],
     );
     const result = await checkContextualRetrievalCoverage(engine);
     expect(result.status).toBe('ok');
@@ -71,14 +61,18 @@ describe('contextual_retrieval_coverage doctor check', () => {
 
   test('chunker_version drift is flagged with fix hint', async () => {
     await engine.executeRaw(
-      `INSERT INTO pages (source_id, slug, type, title, compiled_truth, chunker_version, contextual_retrieval_mode, corpus_generation)
-       VALUES ('default', $1, 'concept', 'Old chunker', 'body', 2, 'title', $2)`,
-      ['test/old-chunker', titleGeneration()],
+      `INSERT INTO pages (source_id, slug, type, title, compiled_truth, chunker_version, contextual_retrieval_mode)
+       VALUES ('default', $1, 'concept', 'Old chunker', 'body', 2, 'title')`,
+      ['test/old-chunker'],
     );
     const result = await checkContextualRetrievalCoverage(engine);
     expect(result.status).toBe('warn');
     expect(result.message).toContain('older chunker_version');
     expect(result.message).toContain('gbrain reindex --markdown');
+    // #5004: name the consequence — pages below the safe-chunk index version
+    // are withheld from every remote/MCP chunk read until reindexed.
+    expect(result.message).toContain('1 page(s) below the safe-chunk index version');
+    expect(result.message).toContain('withheld from remote/MCP chunk retrieval');
   });
 
   test('NULL mode column is flagged separately', async () => {
@@ -89,8 +83,7 @@ describe('contextual_retrieval_coverage doctor check', () => {
     );
     const result = await checkContextualRetrievalCoverage(engine);
     expect(result.status).toBe('warn');
-    expect(result.message).toContain('differ from their expected CR mode');
-    expect(result.message).toContain('stale corpus_generation');
+    expect(result.message).toContain('never evaluated against CR ladder');
   });
 
   test('both drift conditions surface together', async () => {
@@ -104,8 +97,7 @@ describe('contextual_retrieval_coverage doctor check', () => {
     const result = await checkContextualRetrievalCoverage(engine);
     expect(result.status).toBe('warn');
     expect(result.message).toContain('older chunker_version');
-    expect(result.message).toContain('differ from their expected CR mode');
-    expect(result.message).toContain('stale corpus_generation');
+    expect(result.message).toContain('never evaluated against CR ladder');
   });
 
   test('soft-deleted pages are not counted', async () => {
@@ -147,39 +139,5 @@ describe('contextual_retrieval_coverage doctor check', () => {
     const result = await checkContextualRetrievalCoverage(engine);
     expect(result.message).toContain('synopsis failure');
     expect(result.message).toContain('1 triggered page-level fall-back');
-  });
-
-  test('active conservative mode is reported truthfully when none state is aligned', async () => {
-    await engine.setConfig('search.mode', 'conservative');
-    await engine.executeRaw(
-      `INSERT INTO pages (source_id, slug, type, title, compiled_truth, chunker_version, contextual_retrieval_mode, corpus_generation)
-       VALUES ('default', $1, 'concept', 'None', 'body', $2, 'none', NULL)`,
-      ['test/conservative-none', MARKDOWN_CHUNKER_VERSION],
-    );
-
-    const result = await checkContextualRetrievalCoverage(engine);
-    expect(result.status).toBe('ok');
-    expect(result.message).toContain('search.mode=conservative');
-    expect(result.message).toContain('CR mode=none');
-  });
-
-  test('mode and generation drift are detected after active mode changes', async () => {
-    await engine.setConfig('search.mode', 'conservative');
-    await engine.executeRaw(
-      `INSERT INTO pages (source_id, slug, type, title, compiled_truth, chunker_version, contextual_retrieval_mode, corpus_generation)
-       VALUES ('default', $1, 'concept', 'Old title state', 'body', $2, 'title', $3)`,
-      ['test/mode-switch', MARKDOWN_CHUNKER_VERSION, titleGeneration()],
-    );
-
-    const result = await checkContextualRetrievalCoverage(engine);
-    expect(result.status).toBe('warn');
-    expect(result.message).toContain('global=none');
-    expect(result.message).toContain('stale corpus_generation');
-    expect(result.details).toMatchObject({
-      active_search_mode: 'conservative',
-      global_cr_mode: 'none',
-      mode_drift: 1,
-      generation_drift: 1,
-    });
   });
 });

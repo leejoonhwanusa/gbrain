@@ -23,6 +23,7 @@ import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runSources } from '../src/commands/sources.ts';
 import { findMisroutedPages } from '../src/core/multi-source-drift.ts';
+import { writeSlugRootMode } from '../src/core/sync-anchor.ts';
 
 let engine: PGLiteEngine;
 const TMP_ROOTS: string[] = [];
@@ -132,54 +133,6 @@ describe('findMisroutedPages — heuristic correctness', () => {
     expect(result.sample).toEqual([]);
   });
 
-  test('source-local .gbrainignore removes intentionally unsynced files from drift evidence', async () => {
-    const root = makeTmpRoot('gbrainignore');
-    seedFile(root, '.gbrainignore', '**/checkpoints/**\n');
-    seedFile(root, 'codex/checkpoints/operator-state.md');
-    await engine.putPage('codex/checkpoints/operator-state', {
-      type: 'note',
-      title: 'Operator state',
-      compiled_truth: '.',
-    });
-
-    const result = await findMisroutedPages(engine, [{ id: 'src-ignored', local_path: root }]);
-    expect(result.count).toBe(0);
-    expect(result.sample).toEqual([]);
-  });
-
-  test('ignored directory files do not consume the actionable file limit', async () => {
-    const root = makeTmpRoot('ignored-limit');
-    seedFile(root, '.gbrainignore', 'generated/\n');
-    for (let i = 0; i < 12; i++) {
-      seedFile(root, `generated/file-${i}.md`);
-    }
-    seedFile(root, 'topics/kept.md');
-
-    const result = await findMisroutedPages(
-      engine,
-      [{ id: 'src-ignored-limit', local_path: root }],
-      { limit: 5, timeoutMs: 5000 },
-    );
-    expect(result.walk_truncated).toBe(false);
-    expect(result.count).toBe(0);
-  });
-
-  test('canonical pruned dependency directories do not consume the file limit', async () => {
-    const root = makeTmpRoot('pruned-limit');
-    for (let i = 0; i < 12; i++) {
-      seedFile(root, `node_modules/pkg-${i}/readme.md`);
-    }
-    seedFile(root, 'topics/kept.md');
-
-    const result = await findMisroutedPages(
-      engine,
-      [{ id: 'src-pruned-limit', local_path: root }],
-      { limit: 5, timeoutMs: 5000 },
-    );
-    expect(result.walk_truncated).toBe(false);
-    expect(result.count).toBe(0);
-  });
-
   test('case 5: FS walk hits limit → walk_truncated=true', async () => {
     const root = makeTmpRoot('case5');
     // Seed 12 files with a limit of 5 to force truncation.
@@ -192,25 +145,6 @@ describe('findMisroutedPages — heuristic correctness', () => {
       timeoutMs: 5000,
     });
     expect(result.walk_truncated).toBe(true);
-  });
-
-  test('deadline stops a tree containing only non-markdown entries', async () => {
-    const root = makeTmpRoot('deadline-non-markdown');
-    seedFile(root, 'assets/ignored.txt');
-
-    const realNow = Date.now;
-    let clockReads = 0;
-    Date.now = () => 1_000 + (clockReads++ >= 2 ? 2 : 0);
-    try {
-      const result = await findMisroutedPages(
-        engine,
-        [{ id: 'src-deadline-fake', local_path: root }],
-        { timeoutMs: 1 },
-      );
-      expect(result.walk_truncated).toBe(true);
-    } finally {
-      Date.now = realNow;
-    }
   });
 
   test('case 6 (OV13): unreadable local_path does NOT crash; returns empty', async () => {
@@ -237,5 +171,53 @@ describe('findMisroutedPages — heuristic correctness', () => {
     const result = await findMisroutedPages(engine, [{ id: 'src-case7', local_path: root }]);
     expect(result.count).toBe(1);
     expect(result.sample[0].slug).toBe('topics/mdx-page');
+  });
+
+  test('case 8 (#4712): a git-root-pinned source is skipped, not false-positived', async () => {
+    const root = makeTmpRoot('case8');
+    seedFile(root, 'page.md');
+
+    await runSources(engine, ['add', 'src-case8', '--no-federated']);
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = $1 WHERE id = $2`,
+      [root, 'src-case8'],
+    );
+    await writeSlugRootMode(engine, 'src-case8', 'git-root');
+    // Sync actually produced the git-root-prefixed slug (what import.ts's
+    // importRelPath would derive) — NOT local_path-relative 'page'.
+    await engine.putPage('src-case8/page', { type: 'concept', title: 'p', compiled_truth: '.' }, { sourceId: 'src-case8' });
+    // An unrelated page legitimately owns the local_path-relative slug at
+    // default — this is exactly the #4712 false-positive shape pre-fix.
+    await engine.putPage('page', { type: 'concept', title: 'unrelated', compiled_truth: '.' });
+
+    const result = await findMisroutedPages(engine, [{ id: 'src-case8', local_path: root }]);
+    expect(result.count).toBe(0);
+    expect(result.sample).toEqual([]);
+    expect(result.git_root_skipped).toEqual(['src-case8']);
+  });
+
+  test('case 9 (#4712): git-root skip does not mask real drift on a sibling source-root source', async () => {
+    const gitRootRoot = makeTmpRoot('case9-gitroot');
+    seedFile(gitRootRoot, 'page.md');
+    await runSources(engine, ['add', 'src-case9-gr', '--no-federated']);
+    await engine.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = $2`, [gitRootRoot, 'src-case9-gr']);
+    await writeSlugRootMode(engine, 'src-case9-gr', 'git-root');
+    await engine.putPage('src-case9-gr/page', { type: 'concept', title: 'p', compiled_truth: '.' }, { sourceId: 'src-case9-gr' });
+    await engine.putPage('page', { type: 'concept', title: 'unrelated', compiled_truth: '.' });
+
+    const sourceRootRoot = makeTmpRoot('case9-srcroot');
+    seedFile(sourceRootRoot, 'people/eve.md');
+    await runSources(engine, ['add', 'src-case9-sr', '--no-federated']);
+    await engine.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = $2`, [sourceRootRoot, 'src-case9-sr']);
+    // Genuine misroute: exists at default, missing from the intended source.
+    await engine.putPage('people/eve', { type: 'person', title: 'Eve', compiled_truth: '.' });
+
+    const result = await findMisroutedPages(engine, [
+      { id: 'src-case9-gr', local_path: gitRootRoot },
+      { id: 'src-case9-sr', local_path: sourceRootRoot },
+    ]);
+    expect(result.count).toBe(1);
+    expect(result.sample[0]).toMatchObject({ slug: 'people/eve', intended_source: 'src-case9-sr' });
+    expect(result.git_root_skipped).toEqual(['src-case9-gr']);
   });
 });

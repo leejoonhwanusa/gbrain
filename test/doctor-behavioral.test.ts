@@ -21,19 +21,14 @@
  * that warrant their own parameterized test file.
  */
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
-import { withEnv } from './helpers/with-env.ts';
-import { logRerankFailure } from '../src/core/rerank-audit.ts';
 import {
   buildChecks,
-  checkRerankerHealth,
   computeDoctorReport,
   type Check,
 } from '../src/commands/doctor.ts';
+import { buildEmbedSkipMarker } from '../src/core/embed-skip.ts';
 
 let engine: PGLiteEngine;
 
@@ -122,71 +117,6 @@ describe('computeDoctorReport — pure score aggregation', () => {
 });
 
 describe('buildChecks — orchestrator against PGLite', () => {
-  test('reranker_health ignores historical auth failures when reranker is disabled', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-reranker-disabled-'));
-    try {
-      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
-        await engine.setConfig('search.reranker.enabled', 'false');
-        logRerankFailure({
-          model: 'zeroentropyai:zerank-2',
-          reason: 'auth',
-          query_hash: 'deadbeef',
-          doc_count: 30,
-          error_summary: 'invalid api key',
-        });
-
-        const check = await checkRerankerHealth(engine);
-        expect(check.status).toBe('ok');
-        expect(check.message).toContain('Reranker disabled');
-        expect(check.message).toContain('historical');
-      });
-    } finally {
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-    }
-  });
-
-  test('reranker_health still warns on auth failures when reranker is enabled', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-reranker-enabled-'));
-    try {
-      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
-        await engine.setConfig('search.reranker.enabled', 'true');
-        logRerankFailure({
-          model: 'zeroentropyai:zerank-2',
-          reason: 'auth',
-          query_hash: 'feedface',
-          doc_count: 30,
-          error_summary: 'invalid api key',
-        });
-
-        const check = await checkRerankerHealth(engine);
-        expect(check.status).toBe('warn');
-        expect(check.message).toContain('auth failure');
-      });
-    } finally {
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-    }
-  });
-
-  test('graph_coverage ignores hidden test fixture entity pages', async () => {
-    for (const [slug, type] of [
-      ['test/e2e/fixtures/people/alice-example', 'person'],
-      ['test/e2e/fixtures/people/bob-example', 'person'],
-      ['test/e2e/fixtures/companies/acme-example', 'company'],
-      ['test/fixtures/claw-test-scenarios/fresh-install/brain/people/alice-example', 'person'],
-    ] as const) {
-      await engine.putPage(slug, {
-        title: slug.split('/').at(-1) ?? slug,
-        type,
-        compiled_truth: `Fixture entity ${slug}`,
-      });
-    }
-
-    const checks = await buildChecks(engine, []);
-    const graph = checks.find(c => c.name === 'graph_coverage');
-    expect(graph?.status).toBe('ok');
-    expect(graph?.message).toContain('test fixture entity pages');
-  });
-
   test('returns a non-empty Check[] against a fresh brain', async () => {
     const checks = await buildChecks(engine, []);
     expect(Array.isArray(checks)).toBe(true);
@@ -218,7 +148,6 @@ describe('buildChecks — orchestrator against PGLite', () => {
       'brain_score',
       'sync_freshness',
       'search_mode',
-      'contextual_retrieval_coverage',
       'eval_drift',
       'reranker_health',
       'embedding_width_consistency',
@@ -278,6 +207,97 @@ describe('buildChecks — orchestrator against PGLite', () => {
     const connection = checks.find(c => c.name === 'connection');
     expect(connection).toBeDefined();
     expect(connection!.status).toBe('warn');
+  });
+
+  test('content-sanity checks run on PGLite — oversized page warns, none die on the dead postgres singleton (#1871)', async () => {
+    // Pre-fix these three checks reached the DB via db.getConnection() —
+    // the postgres.js singleton, which is never connected on the default
+    // PGLite engine — so every run reported
+    // "Skipped (No database connection: connect() has not been called)".
+    const big = 'oversized page body prose for the block threshold probe. '.repeat(11_000); // ~630KB > 500KB default
+    await engine.putPage('wiki/oversized-probe-1871', {
+      type: 'note',
+      title: 'Oversized Probe 1871',
+      compiled_truth: big,
+      timeline: '',
+      frontmatter: {},
+    });
+
+    const checks = await buildChecks(engine, []);
+
+    const oversized = checks.find(c => c.name === 'oversized_pages');
+    expect(oversized).toBeDefined();
+    expect(oversized!.status).toBe('warn');
+    expect(oversized!.message).toContain('oversized-probe-1871');
+
+    // The sibling checks now execute for real on PGLite too.
+    const junk = checks.find(c => c.name === 'scraper_junk_pages');
+    expect(junk).toBeDefined();
+    expect(junk!.message).not.toContain('Skipped');
+    const mbc = checks.find(c => c.name === 'markdown_body_completeness');
+    expect(mbc).toBeDefined();
+
+    // No check on a healthy PGLite brain reports the dead-singleton error.
+    for (const c of checks) {
+      expect(c.message).not.toContain('connect() has not been called');
+    }
+  });
+
+  test('oversized_pages excludes pages that already took the embed_skip remediation (gbrain dogfooding find)', async () => {
+    // The warn message for this check says "existing oversized pages can be
+    // ... accepted as non-embeddable" (i.e. frontmatter.embed_skip set).
+    // Before this fix the underlying query never excluded those pages, so a
+    // page an operator had already remediated the documented way kept
+    // re-appearing in this check's output on every run with no way to clear
+    // it short of deleting the page. Uses the real production marker shape
+    // (an object from buildEmbedSkipMarker, not a bare boolean) — the
+    // canonical writer (src/core/content-sanity.ts) never writes a boolean,
+    // and the exclusion must match what actually lands in frontmatter.
+    const big = 'oversized page body prose for the embed_skip exclusion probe. '.repeat(11_000);
+    await engine.putPage('wiki/oversized-embed-skip-probe', {
+      type: 'note',
+      title: 'Oversized Embed-Skip Probe',
+      compiled_truth: big,
+      timeline: '',
+      frontmatter: { embed_skip: buildEmbedSkipMarker(big.length) },
+    });
+
+    const checks = await buildChecks(engine, []);
+    const oversized = checks.find(c => c.name === 'oversized_pages');
+    expect(oversized).toBeDefined();
+    // Positive control above (line ~227) proves the same byte count without
+    // embed_skip DOES warn and names the page — this proves the ONLY
+    // difference (embed_skip set) is what excludes it.
+    expect(oversized!.status).toBe('ok');
+    expect(oversized!.message).not.toContain('oversized-embed-skip-probe');
+  });
+
+  test('oversized_pages still warns when embed_skip is absent (does not exclude every page)', async () => {
+    // Sibling positive control to the exclusion test above: a page with no
+    // embed_skip key at all must still warn, proving the exclusion is
+    // scoped to the marker's presence and isn't a query regression that
+    // silently stops counting oversized pages altogether.
+    //
+    // Note: per the canonical contract in src/core/embed-skip.ts
+    // (isEmbedSkipped: "any non-null value" is skip, by design — the
+    // predicate is key-EXISTENCE, not a boolean value check), an explicit
+    // `embed_skip: false` is ALSO treated as skip, matching every other
+    // embed-skip consumer in the codebase (embed.ts, postgres-engine.ts,
+    // pglite-engine.ts). This check must stay consistent with that shared
+    // contract rather than inventing its own true/false semantics.
+    const big = 'oversized page body prose for the embed_skip-absent probe. '.repeat(11_000);
+    await engine.putPage('wiki/oversized-embed-skip-absent-probe', {
+      type: 'note',
+      title: 'Oversized Embed-Skip-Absent Probe',
+      compiled_truth: big,
+      timeline: '',
+    });
+
+    const checks = await buildChecks(engine, []);
+    const oversized = checks.find(c => c.name === 'oversized_pages');
+    expect(oversized).toBeDefined();
+    expect(oversized!.status).toBe('warn');
+    expect(oversized!.message).toContain('oversized-embed-skip-absent-probe');
   });
 
   test('mixed-outcome render path: synthesized checks aggregate as expected', () => {

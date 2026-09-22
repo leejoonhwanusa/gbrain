@@ -1,3 +1,4 @@
+import { assertManagedFilesystemWrite } from '../core/persistence/filesystem-guard.ts';
 /**
  * gbrain frontmatter — Frontmatter validation, audit, and auto-repair.
  *
@@ -17,7 +18,7 @@
 
 import { readFileSync, writeFileSync, existsSync, lstatSync, readdirSync } from 'fs';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
-import { join, relative, resolve } from 'path';
+import { join, relative, resolve, basename, dirname } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadConfig, toEngineConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
@@ -25,12 +26,14 @@ import { parseMarkdown, type ParseValidationCode } from '../core/markdown.ts';
 import {
   autoFixFrontmatter,
   createFrontmatterBackup,
+  isFrontmatterScannablePath,
   makeFrontmatterBackupRunId,
   scanBrainSources,
   type AuditReport,
   type AuditFix,
 } from '../core/brain-writer.ts';
-import { isSyncable, pruneDir, slugifyPath } from '../core/sync.ts';
+import { collectGitVisibleFiles } from '../core/git-visible-files.ts';
+import { isMarkdownFilePath, pruneDir, slugifyPath } from '../core/sync.ts';
 
 export async function runFrontmatter(args: string[]): Promise<void> {
   const sub = args[0];
@@ -154,6 +157,27 @@ interface FileValidation {
   backupPath?: string;
 }
 
+/**
+ * Walk up from `start` (file or dir) to the brain root — the nearest ancestor
+ * containing a `.git` marker — so slug derivation is brain-root-relative,
+ * matching how sync/extract compute slugs. Falls back to the start's own
+ * directory when no marker is found. Fixes #565: for a single-file target,
+ * `relative(resolve(target), file)` was empty (target === file) and fell back
+ * to the ABSOLUTE path, yielding bogus "root/brain/..." slugs and false
+ * SLUG_MISMATCH — which the install-hook pre-commit hook hits on every commit.
+ */
+function findBrainRoot(start: string): string {
+  const startDir = lstatSync(start).isDirectory() ? start : dirname(start);
+  let candidate = startDir;
+  for (let i = 0; i < 40; i++) {
+    if (existsSync(join(candidate, '.git'))) return candidate;
+    const parent = resolve(candidate, '..');
+    if (parent === candidate) break;
+    candidate = parent;
+  }
+  return startDir;
+}
+
 async function runValidate(rest: string[]): Promise<void> {
   const flags: ValidateFlags = { json: false, fix: false, dryRun: false };
   let target: string | null = null;
@@ -175,14 +199,24 @@ async function runValidate(rest: string[]): Promise<void> {
     setCliExitVerdict(1);
     return;
   }
+  if (lstatSync(resolved).isFile() && !isMarkdownFilePath(resolved)) {
+    console.error(`error: frontmatter validation supports only .md and .mdx files: ${target}`);
+    setCliExitVerdict(1);
+    return;
+  }
 
+  const brainRoot = findBrainRoot(resolved);
   const files = collectFiles(resolved);
+  if (flags.fix && !flags.dryRun) for (const file of files) assertManagedFilesystemWrite(file);
   const results: FileValidation[] = [];
   const backupRunId = makeFrontmatterBackupRunId();
 
   for (const file of files) {
     const content = readFileSync(file, 'utf8');
-    const expectedSlug = slugifyPath(relative(resolve(target), file) || file);
+    const rel = relative(brainRoot, file);
+    // Files above/outside the brain root fall back to basename rather than
+    // emitting a "../"-prefixed slug for non-brain files.
+    const expectedSlug = slugifyPath(rel && !rel.startsWith('..') ? rel : basename(file));
     const parsed = parseMarkdown(content, file, { validate: true, expectedSlug });
     const errs = parsed.errors ?? [];
     const result: FileValidation = {
@@ -194,6 +228,7 @@ async function runValidate(rest: string[]): Promise<void> {
       const { content: fixed, fixes } = autoFixFrontmatter(content, { filePath: file });
       result.fixesApplied = fixes;
       if (fixes.length > 0 && !flags.dryRun) {
+        assertManagedFilesystemWrite(file);
         result.backupPath = createFrontmatterBackup(file, { sourcePath: resolved, runId: backupRunId });
         writeFileSync(file, fixed, 'utf8');
       }
@@ -270,8 +305,17 @@ export function collectFiles(
 ): string[] {
   const st = lstatSync(target);
   if (st.isFile()) {
-    return [target];
+    // An explicit Markdown target is operator intent, even for structural
+    // basenames that bulk scans intentionally skip.
+    return isMarkdownFilePath(basename(target)) ? [target] : [];
   }
+
+  const gitFiles = collectGitVisibleFiles(target, isFrontmatterScannablePath);
+  if (gitFiles) {
+    if (visitDir) visitDir(target);
+    return gitFiles;
+  }
+
   const out: string[] = [];
   const stack = [target];
   if (visitDir) visitDir(target);
@@ -300,7 +344,7 @@ export function collectFiles(
         stack.push(full);
       } else if (entryStat.isFile()) {
         const rel = relative(target, full);
-        if (isSyncable(rel, { strategy: 'markdown' })) {
+        if (isFrontmatterScannablePath(rel)) {
           out.push(full);
         }
       }
@@ -389,6 +433,11 @@ async function runGenerate(args: string[]): Promise<void> {
 
   const rootPath = resolve(targetPath);
   const isDir = statSync(rootPath).isDirectory();
+  if (!isDir && !isMarkdownFilePath(rootPath)) {
+    console.error(`error: frontmatter generation supports only .md and .mdx files: ${targetPath}`);
+    setCliExitVerdict(1);
+    return;
+  }
 
   // Find the brain root — walk up from targetPath looking for .git or known brain markers.
   // Inference rules match against brain-root-relative paths (e.g., "people/alice.md").
@@ -426,13 +475,15 @@ async function runGenerate(args: string[]): Promise<void> {
 
   function processFile(absPath: string, relPath: string) {
     scanned++;
-    if (!isSyncable(relPath, { strategy: 'markdown' })) return;
+    if (!isFrontmatterScannablePath(relPath)) return;
 
     // Skip symlinks
     try { if (lstatSync(absPath).isSymbolicLink()) return; } catch { return; }
 
     let content: string;
-    try { content = readFileSync(absPath, 'utf-8'); } catch { return; }
+    // #4798: strip a UTF-8 BOM so heading-title inference (and --fix's
+    // written body) match what `gbrain sync` / `import` produce.
+    try { content = readFileSync(absPath, 'utf-8').replace(/^\uFEFF/, ''); } catch { return; }
 
     const inferred = inferFrontmatter(relPath, content);
     if (inferred.skipped) {
@@ -458,6 +509,7 @@ async function runGenerate(args: string[]): Promise<void> {
       const newContent = fm + '\n' + content;
       // Safety: write a centralized backup first.
       createFrontmatterBackup(absPath, { sourcePath: brainRoot, runId: backupRunId });
+      assertManagedFilesystemWrite(absPath);
       writeFileSync(absPath, newContent, 'utf-8');
       written++;
     }

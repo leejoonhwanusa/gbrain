@@ -17,8 +17,10 @@ afterEach(() => { try { rmSync(dir, { recursive: true, force: true }); } catch {
 
 describe('readSupervisorPid', () => {
   test('default PID file uses the Windows profile when HOME is unset', () => {
+    if (process.platform !== 'win32') return;
     const env = { ...process.env, USERPROFILE: dir } as Record<string, string | undefined>;
     delete env.HOME;
+    delete env.GBRAIN_HOME;
     const output = execFileSync(
       'bun',
       ['-e', "import { DEFAULT_PID_FILE } from './src/core/minions/supervisor.ts'; console.log(DEFAULT_PID_FILE)"],

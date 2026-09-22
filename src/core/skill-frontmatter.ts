@@ -19,7 +19,6 @@
  *     value) sets `brain_first`. Near-misses (`brain-first`, `BrainFirst`,
  *     `brain_first: 'exempt'`) populate `brain_first_typo` for doctor to
  *     surface as a paste-ready fix hint.
- *   - Accepts LF and Windows CRLF line endings.
  *   - Returns null when no frontmatter fence is present (no `---`).
  *
  * Strictness rationale (Q3 + F3 from /plan-eng-review 2026-05-19): silent
@@ -27,6 +26,8 @@
  * thinking it works deserves a loud hint pointing at the canonical form,
  * not a silent failure to exempt.
  */
+
+import { FAILSAFE_SCHEMA, safeLoad as yamlSafeLoad } from 'js-yaml';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,6 +48,11 @@ export interface ParsedFrontmatter {
   tools?: string[];
   /** Routing triggers list. */
   triggers?: string[];
+  /**
+   * Machine-checkable preconditions this skill needs before it can run;
+   * each is a `kind:arg` token — see skillpack/preconditions.ts.
+   */
+  requires?: string[];
   /**
    * v0.36.x brain-first declarative opt-out. Only the literal canonical
    * value `'exempt'` (no quotes, lowercase, snake_case key) populates this.
@@ -83,7 +89,8 @@ export interface ParsedFrontmatter {
  * `readFileSync(path, 'utf-8')` at the boundary.
  */
 export function parseSkillFrontmatter(content: string): ParsedFrontmatter | null {
-  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  const normalized = content.replace(/\r\n/g, '\n');
+  const fmMatch = normalized.match(/^---\n([\s\S]*?)\n---/);
   if (!fmMatch) return null;
   const raw = fmMatch[1];
   const out: ParsedFrontmatter = { raw };
@@ -103,6 +110,7 @@ export function parseSkillFrontmatter(content: string): ParsedFrontmatter | null
   out.writes_to = parseArrayField(raw, 'writes_to');
   out.tools = parseArrayField(raw, 'tools');
   out.triggers = parseArrayField(raw, 'triggers');
+  out.requires = parseArrayField(raw, 'requires');
 
   // --- brain_first (strict canonical) ---
   parseBrainFirst(raw, out);
@@ -128,6 +136,20 @@ export function parseSkillFrontmatter(content: string): ParsedFrontmatter | null
  * top-level fields below it. Stops at the first non-indented line.
  */
 function parseArrayField(raw: string, field: string): string[] | undefined {
+  try {
+    const parsed = yamlSafeLoad(raw, { schema: FAILSAFE_SCHEMA });
+    if (parsed && typeof parsed === 'object' && Object.hasOwn(parsed, field)) {
+      const value = (parsed as Record<string, unknown>)[field];
+      if (!Array.isArray(value)) return undefined;
+      return value
+        .filter((item): item is string => typeof item === 'string')
+        .map(item => item.trim())
+        .filter(Boolean);
+    }
+  } catch {
+    // Preserve the tolerant legacy behavior for partially malformed YAML.
+  }
+
   // Inline form: `field: [a, b, c]` or `field: []`
   const inlineRe = new RegExp(`^${field}:\\s*\\[([^\\]]*)\\]\\s*$`, 'm');
   const inlineMatch = raw.match(inlineRe);
@@ -144,7 +166,7 @@ function parseArrayField(raw: string, field: string): string[] | undefined {
   const blockMatch = raw.match(blockRe);
   if (blockMatch) {
     return blockMatch[1]
-      .split(/\r?\n/)
+      .split('\n')
       .map(l => l.replace(/^[ \t]+-[ \t]+/, '').replace(/^["']|["']$/g, '').trim())
       .filter(Boolean);
   }

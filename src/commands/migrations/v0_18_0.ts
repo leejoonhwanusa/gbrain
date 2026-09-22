@@ -20,6 +20,7 @@
  */
 
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
+import { appendCompletedMigration } from '../../core/preferences.ts';
 import { loadConfig, toEngineConfig } from '../../core/config.ts';
 import { createEngine } from '../../core/engine-factory.ts';
 
@@ -197,8 +198,18 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
 }
 
 function finalize(phases: OrchestratorPhaseResult[], status: 'complete' | 'partial' | 'failed'): OrchestratorResult {
-  // completed.jsonl is appended exactly once by apply-migrations.ts. Keeping
-  // ledger ownership out of orchestrators also makes dry-run side-effect-free.
+  if (status !== 'failed') {
+    try {
+      appendCompletedMigration({
+        version: '0.18.0',
+        completed_at: new Date().toISOString(),
+        status: status as 'complete' | 'partial',
+        phases: phases.map(p => ({ name: p.name, status: p.status })),
+      });
+    } catch {
+      // Best-effort.
+    }
+  }
   return { version: '0.18.0', status, phases };
 }
 

@@ -5,15 +5,17 @@
  * config writes work [CDX-7]. Idempotent: if `search.mode` is already set
  * (re-init / second run), the picker is skipped entirely.
  *
- * TTY flow shows the menu. Non-TTY (CI, scripted init, --mcp-only) writes
- * `balanced` and prints the one-line hint pointing at `gbrain config set
- * search.mode`. The mode picker NEVER blocks an init run — readLineSafe
- * caps at 60s and falls back to `balanced` on timeout / EOF.
+ * TTY flow shows the menu. Non-TTY (CI, scripted init, --mcp-only) applies
+ * the auto-recommendation, prints the cost matrix + an [AGENT] directive to
+ * confirm with the operator, and points at `gbrain config set search.mode`.
+ * The mode picker NEVER blocks an init run — readLineSafe caps at 60s and
+ * falls back to the recommendation on timeout / EOF.
  *
  * Smart auto-suggestion: reads models.tier.subagent / models.default /
- * OPENAI_API_KEY presence + brain size hint to RECOMMEND a mode. The
- * recommendation is informational only — the user picks. This is the
- * "agents perfectly tune for user needs" piece at install time.
+ * expansion-capable key presence (Anthropic/OpenAI/Google) + brain size hint
+ * to RECOMMEND a mode. The recommendation is informational only — the user
+ * picks. This is the "agents perfectly tune for user needs" piece at
+ * install time.
  */
 
 import type { BrainEngine } from '../core/engine.ts';
@@ -36,8 +38,11 @@ export interface ModePickerInputs {
   subagentModel?: string | null;
   /** Configured default model id. */
   defaultModel?: string | null;
-  /** True iff an OpenAI API key is configured. */
-  hasOpenAIKey?: boolean;
+  /** True iff an expansion-capable API key (Anthropic / OpenAI / Google) is
+   *  configured. LLM query expansion routes through the gateway's chat lane,
+   *  not the embedding lane — an OpenAI-only gate wrongly told Anthropic-keyed
+   *  installs "no LLM expansion possible". */
+  hasExpansionKey?: boolean;
   /** Approximate page count of the brain (after initSchema, before bulk import). */
   pageCount?: number;
 }
@@ -50,8 +55,8 @@ export interface ModePickerInputs {
  * shape per the v0.32.3 install-picker directive):
  *   - Opus / Frontier model OR Sonnet / unknown → tokenmax (max-quality default)
  *   - Haiku subagent → conservative (cost-sensitive setups)
- *   - No OpenAI key configured → conservative (LLM expansion not possible
- *     anyway, so tight budget makes more sense)
+ *   - No expansion-capable key (Anthropic/OpenAI/Google) → conservative
+ *     (LLM expansion cannot run anyway, so tight budget makes more sense)
  *
  * Rationale: the previous "default to balanced unless Opus detected" logic
  * silently downgraded users who were running Sonnet-tier work and expected
@@ -67,10 +72,10 @@ export function recommendModeFor(inputs: ModePickerInputs): { mode: SearchMode; 
       reason: 'Haiku subagent tier detected — tight 4K budget keeps per-call cost down.',
     };
   }
-  if (inputs.hasOpenAIKey === false) {
+  if (inputs.hasExpansionKey === false) {
     return {
       mode: 'conservative',
-      reason: 'No OpenAI key configured — semantic cache still works, but no LLM expansion possible.',
+      reason: 'No expansion-capable API key (Anthropic/OpenAI/Google) — semantic cache still works, but LLM query expansion cannot run.',
     };
   }
   const opus = /opus/i.test(inputs.defaultModel ?? '') || /opus/i.test(inputs.subagentModel ?? '');
@@ -109,7 +114,12 @@ async function resolveInputs(engine: BrainEngine): Promise<ModePickerInputs> {
   return {
     subagentModel,
     defaultModel,
-    hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY),
+    hasExpansionKey: Boolean(
+      process.env.ANTHROPIC_API_KEY ||
+      process.env.OPENAI_API_KEY ||
+      process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+      process.env.GEMINI_API_KEY, // gateway accepts GEMINI_API_KEY as a first-class alias
+    ),
     pageCount,
   };
 }
@@ -122,8 +132,10 @@ Three named modes. Cost depends on BOTH the mode AND your downstream model
 
 The "cost" isn't gbrain itself — it's the downstream agent's input cost
 reading the retrieved chunks back into its context window. gbrain's own
-overhead is rounding-error (semantic cache is free; tokenmax adds ~$1.50
-per 1K queries for the Haiku expansion call).
+overhead is rounding-error (semantic result caching is temporarily disabled,
+so budget for fresh retrieval on every query; gbrain query adds ~$1.50 per 1K
+queries for the Haiku expansion call in every mode — --no-expand skips it;
+gbrain search never expands).
 
 Per-query cost @ 10K queries/mo (full search payload, no cache savings):
 
@@ -151,6 +163,9 @@ discount on top of these numbers (cache hits skip downstream entirely).
   3) tokenmax       no cap, LLM query expansion ON, 50 chunks.
                     Best for: Opus/frontier models, max retrieval quality,
                     low-volume high-stakes work.
+
+("no LLM expansion" governs gbrain search + callers that leave expansion
+unset; gbrain query expands in every mode unless you pass --no-expand.)
 
 You can change this any time with: gbrain config set search.mode <mode>
 Per-knob tuning + recommendation engine ships at: gbrain search tune
@@ -214,7 +229,9 @@ export async function runModePicker(
   // 2 stderr lines that agents typically miss / don't relay to the human.
   // Now: the agent sees the same matrix the human-TTY picker shows, plus
   // a directive saying "show this to your operator and confirm before
-  // moving on." Default-applied mode is tokenmax (preserves v0.31.x shape).
+  // moving on." The applied default is the recommendation above — the
+  // banner interpolates it (a static "preserves the v0.31.x shape" line
+  // used to claim tokenmax semantics even when conservative was applied).
   if (!process.stdin.isTTY) {
     try { await engine.setConfig(SEARCH_MODE_KEY, rec.mode); } catch { /* swallow */ }
     console.log('');
@@ -224,10 +241,10 @@ export async function runModePicker(
     console.log('═══════════════════════════════════════════════════════════════');
     console.log('');
     console.log('[AGENT] Before continuing, SHOW this matrix to your operator and');
-    console.log('[AGENT] ask which mode they want. The default above preserves the');
-    console.log('[AGENT] v0.31.x retrieval shape. Run `gbrain config set search.mode');
-    console.log('[AGENT] <conservative|balanced|tokenmax>` if the operator picks');
-    console.log('[AGENT] differently. See INSTALL_FOR_AGENTS.md Step 3.5 for the');
+    console.log(`[AGENT] ask which mode they want. The default above (${rec.mode}) was`);
+    console.log('[AGENT] auto-selected from the Reason line. Run `gbrain config set');
+    console.log('[AGENT] search.mode <conservative|balanced|tokenmax>` if the operator');
+    console.log('[AGENT] picks differently. See INSTALL_FOR_AGENTS.md Step 3.5 for the');
     console.log('[AGENT] full protocol.');
     console.log('');
     console.log('Per-query cost @ 10K queries/mo (search payload only, no cache savings):');

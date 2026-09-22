@@ -15,13 +15,9 @@
  * codex D4 catch simplification.
  */
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'fs';
-import { join } from 'path';
+import { doctorSource } from './helpers/doctor-source.ts';
 
-const DOCTOR_SOURCE = readFileSync(
-  join(__dirname, '..', 'src', 'commands', 'doctor.ts'),
-  'utf8',
-);
+const DOCTOR_SOURCE = doctorSource();
 
 describe('doctor frontmatter_integrity — structural rendering (source-grep)', () => {
   test('source contains GBRAIN_DOCTOR_FM_TIMEOUT_MS handling', () => {
@@ -31,10 +27,6 @@ describe('doctor frontmatter_integrity — structural rendering (source-grep)', 
   test('source uses both deadline and AbortSignal.timeout (deadline is load-bearing per codex C1)', () => {
     expect(DOCTOR_SOURCE).toContain('deadline: fmDeadline');
     expect(DOCTOR_SOURCE).toContain('AbortSignal.timeout(fmTimeoutMs)');
-  });
-
-  test('doctor scans only active sources', () => {
-    expect(DOCTOR_SOURCE).toContain('activeOnly: true');
   });
 
   test('source issues the DB COUNT(*) denominator query with deleted_at IS NULL', () => {

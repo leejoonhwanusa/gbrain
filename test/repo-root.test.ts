@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -246,6 +246,24 @@ describe('findRepoRoot', () => {
 
     expect(found.dir).toBe(join(checkout, 'skills'));
     expect(found.source).toBe('install_path');
+  });
+
+  it('compiled executable fallback rejects a skills symlink outside the checkout', () => {
+    const cwd = scratch();
+    const runtimeHome = scratch();
+    const checkout = join(runtimeHome, 'gbrain');
+    const outsideSkills = join(scratch(), 'skills');
+    seedSkillsDir(outsideSkills);
+    mkdirSync(join(checkout, 'src'), { recursive: true });
+    writeFileSync(join(checkout, 'src', 'cli.ts'), '// gbrain marker\n');
+    symlinkSync(outsideSkills, join(checkout, 'skills'), process.platform === 'win32' ? 'junction' : 'dir');
+
+    const found = autoDetectSkillsDirReadOnly(cwd, {}, {
+      moduleUrl: 'bun:compiled/gbrain.exe',
+      execPath: join(runtimeHome, '.bun', 'bin', 'gbrain.exe'),
+    });
+
+    expect(found.dir).toBeNull();
   });
 
   it('v0.31.7 D3-5: autoDetectSkillsDirReadOnly returns same primary detection on success', () => {

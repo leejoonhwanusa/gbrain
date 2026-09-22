@@ -24,24 +24,28 @@
  *    the FS walk into one array, then run ONE SELECT against pages with a
  *    VALUES clause. NOT a per-file loop (which would be 20K round trips on
  *    a 10K-file source).
- *  - Time + size bounds: cap each source at 10K files and the full walk at
- *    15s. Bail with a "check
+ *  - Time + size bounds: cap the walk at 10K files OR 5s. Bail with a "check
  *    skipped, walk too large" status instead of letting doctor hang.
  *  - Wrapper try/catch around the walk per OV13: ENOENT/EACCES on local_path
  *    yields zero files, NOT a thrown crash that takes down the whole doctor
  *    run.
+ *  - #4712: the slug derivation below is `local_path`-relative only, which
+ *    is the `'source-root'` slug-root shape (#4342, src/core/sync-anchor.ts).
+ *    A source pinned to `'git-root'` mode produces slugs prefixed with its
+ *    subdir under the repo root instead — this module has no git-root
+ *    discovery of its own, so it CANNOT compute the slug sync actually
+ *    produces for such a source. Rather than compare against the wrong
+ *    slug (false-positive drift, with delete advice naming an unrelated
+ *    page), a git-root-pinned source is skipped entirely and reported via
+ *    `git_root_skipped`. True prefix-aware matching is tracked as a
+ *    follow-up, not attempted here.
  */
 
 import { readdirSync, lstatSync, statSync } from 'fs';
 import { join, relative } from 'path';
 import type { BrainEngine } from './engine.ts';
-import {
-  isSyncable,
-  loadGbrainIgnoreGlobs,
-  matchesGbrainIgnorePath,
-  pathToSlug,
-  pruneDir,
-} from './sync.ts';
+import { pathToSlug } from './sync.ts';
+import { readSlugRootMode } from './sync-anchor.ts';
 
 export interface SourceWithPath {
   id: string;
@@ -60,10 +64,17 @@ export interface MisroutedResult {
   /** Per-source breakdown: slugs that appear at (default, slug) but NOT at (X, slug). */
   count: number;
   sample: MisroutedSample[];
+  /**
+   * #4712: source IDs skipped because their persisted slug_root_mode is
+   * 'git-root' — this check only knows how to derive 'source-root'-shaped
+   * (local_path-relative) slugs, so a git-root-pinned source is excluded
+   * rather than checked against the wrong slug shape.
+   */
+  git_root_skipped: string[];
 }
 
 const DEFAULT_FILE_LIMIT = 10_000;
-const DEFAULT_MULTI_SOURCE_DRIFT_TIMEOUT_MS = 15_000;
+const DEFAULT_TIMEOUT_MS = 5_000;
 const SAMPLE_LIMIT = 5;
 
 /**
@@ -79,17 +90,11 @@ function walkMarkdownAndMdxFiles(
   root: string,
   limit: number,
   deadlineMs: number,
-  excludePatterns: string[] = [],
 ): { files: { relPath: string }[]; truncated: boolean } {
   const files: { relPath: string }[] = [];
-  const ignoredDirectoryPatterns = excludePatterns.filter((pattern) => pattern.endsWith('/**'));
   let truncated = false;
   function walk(d: string): void {
     if (truncated) return;
-    if (Date.now() >= deadlineMs) {
-      truncated = true;
-      return;
-    }
     let entries: string[];
     try {
       entries = readdirSync(d);
@@ -99,11 +104,12 @@ function walkMarkdownAndMdxFiles(
     }
     for (const entry of entries) {
       if (truncated) return;
-      if (Date.now() >= deadlineMs) {
-        truncated = true;
-        return;
-      }
       if (entry.startsWith('.')) continue;
+      // Skip heavy non-content dirs so the walk doesn't exhaust the time
+      // budget on dependency/build trees (node_modules can be 50k+ files
+      // with zero .md). These are never gbrain page sources.
+      if (entry === 'node_modules' || entry === 'dist' || entry === 'build' ||
+          entry === '.next' || entry === 'vendor' || entry === 'target') continue;
       const full = join(d, entry);
       let isDir = false;
       try {
@@ -112,22 +118,23 @@ function walkMarkdownAndMdxFiles(
         continue;
       }
       if (isDir) {
-        if (!pruneDir(entry, d)) continue;
-        const relDir = relative(root, full).replace(/\\/g, '/');
-        if (
-          ignoredDirectoryPatterns.length > 0
-          && matchesGbrainIgnorePath(`${relDir}/__gbrain_walk_probe__`, ignoredDirectoryPatterns)
-        ) continue;
+        // Time check on directory descent too, so a deep dependency-free
+        // tree still respects the deadline even before any .md is found.
+        if (Date.now() >= deadlineMs) { truncated = true; return; }
         walk(full);
         continue;
       }
       const isMd = entry.endsWith('.md') || entry.endsWith('.mdx');
       if (!isMd) continue;
       if (entry.startsWith('_')) continue; // matches extract.ts convention
-      const relPath = relative(root, full).replace(/\\/g, '/');
-      if (!isSyncable(relPath, { strategy: 'markdown', exclude: excludePatterns })) continue;
-      files.push({ relPath });
+      files.push({ relPath: relative(root, full) });
       if (files.length >= limit) {
+        truncated = true;
+        return;
+      }
+      // Time check is cheap; do it on every push so a slow filesystem can't
+      // run unbounded.
+      if (Date.now() >= deadlineMs) {
         truncated = true;
         return;
       }
@@ -197,12 +204,13 @@ export async function findMisroutedPages(
   opts: { limit?: number; timeoutMs?: number } = {},
 ): Promise<MisroutedResult> {
   const limit = opts.limit ?? DEFAULT_FILE_LIMIT;
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_MULTI_SOURCE_DRIFT_TIMEOUT_MS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const deadlineMs = Date.now() + timeoutMs;
 
   let totalCount = 0;
   let walkTruncated = false;
   const sample: MisroutedSample[] = [];
+  const gitRootSkipped: string[] = [];
 
   for (const src of sources) {
     if (src.id === 'default') continue;
@@ -211,8 +219,16 @@ export async function findMisroutedPages(
       walkTruncated = true;
       break;
     }
-    const exclude = loadGbrainIgnoreGlobs(src.local_path);
-    const { files, truncated } = walkMarkdownAndMdxFiles(src.local_path, limit, deadlineMs, exclude);
+    // #4712: local_path-relative slugs are only correct for 'source-root'-
+    // pinned sources. A 'git-root' pin means sync produces subdir-prefixed
+    // slugs this module doesn't know how to reconstruct — skip rather than
+    // compare against a slug shape that will never match.
+    const rootMode = await readSlugRootMode(engine, src.id);
+    if (rootMode === 'git-root') {
+      gitRootSkipped.push(src.id);
+      continue;
+    }
+    const { files, truncated } = walkMarkdownAndMdxFiles(src.local_path, limit, deadlineMs);
     if (truncated) walkTruncated = true;
     if (files.length === 0) continue;
 
@@ -235,5 +251,5 @@ export async function findMisroutedPages(
     }
   }
 
-  return { walk_truncated: walkTruncated, count: totalCount, sample };
+  return { walk_truncated: walkTruncated, count: totalCount, sample, git_root_skipped: gitRootSkipped };
 }

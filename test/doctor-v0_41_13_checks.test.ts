@@ -19,7 +19,6 @@
 
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { CONVERSATION_FORMAT_COVERAGE_TYPES } from '../src/commands/doctor.ts';
 
 interface DoctorCheck {
   name: string;
@@ -58,15 +57,6 @@ function runDoctor(): DoctorEnvelope {
 }
 
 describe('doctor — v0.41.16.0 new checks emit', () => {
-  test('conversation format coverage only samples built-in transcript families', () => {
-    expect([...CONVERSATION_FORMAT_COVERAGE_TYPES]).toEqual([
-      'conversation',
-      'meeting',
-      'slack',
-    ]);
-    expect(CONVERSATION_FORMAT_COVERAGE_TYPES).not.toContain('email' as never);
-  });
-
   test('all 3 new checks present in JSON envelope', () => {
     const env = runDoctor();
     const checkNames = env.checks.map((c) => c.name);

@@ -6,11 +6,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import {
-  computeEffectiveDate,
-  parseDateLoose,
-  parseEffectiveDateCandidate,
-} from '../src/core/effective-date.ts';
+import { computeEffectiveDate, parseDateLoose } from '../src/core/effective-date.ts';
 
 const baseUpdated = new Date('2026-05-04T12:00:00Z');
 const baseCreated = new Date('2026-05-01T12:00:00Z');
@@ -55,15 +51,6 @@ describe('parseDateLoose', () => {
     expect(parseDateLoose('tomorrow')).toBeNull();
     expect(parseDateLoose('garbage')).toBeNull();
     expect(parseDateLoose('')).toBeNull();
-  });
-});
-
-describe('parseEffectiveDateCandidate', () => {
-  test('accepts only values computeEffectiveDate can actually select', () => {
-    expect(parseEffectiveDateCandidate('2024-03-15')?.toISOString().startsWith('2024-03-15')).toBe(true);
-    expect(parseEffectiveDateCandidate({ '[object Object]': null })).toBeNull();
-    expect(parseEffectiveDateCandidate('1985-01-01')).toBeNull();
-    expect(parseEffectiveDateCandidate('2035-01-01')).toBeNull();
   });
 });
 

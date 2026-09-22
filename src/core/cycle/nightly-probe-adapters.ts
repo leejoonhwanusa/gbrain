@@ -21,6 +21,7 @@ import { readFileSync, existsSync } from 'node:fs';
 export interface LongMemEvalProbeArgs {
   fixturePath: string;
   outputPath: string;
+  searchConfigSnapshot?: Record<string, string>;
 }
 
 /** Arguments accepted by the cross-modal adapter. */
@@ -47,14 +48,15 @@ export interface CrossModalBatchSummary {
  * The CLI's first positional arg is `<dataset.jsonl>` (fixturePath).
  * `--output PATH` writes per-question rows.
  *
- * The CLI calls `process.exit(1)` on errors. The adapter doesn't trap
- * exit — the caller (nightly-quality-probe phase) wraps in try/catch and
- * treats any exit-style failure as a probe failure that doesn't crash
- * autopilot.
+ * Embedded failures throw so the nightly phase can audit the failure
+ * without terminating autopilot. Standalone CLI invocations still exit.
  */
 export async function runLongMemEvalForProbe(args: LongMemEvalProbeArgs): Promise<void> {
   const { runEvalLongMemEval } = await import('../../commands/eval-longmemeval.ts');
-  await runEvalLongMemEval([args.fixturePath, '--output', args.outputPath]);
+  await runEvalLongMemEval(
+    [args.fixturePath, '--output', args.outputPath],
+    { searchConfigSnapshot: args.searchConfigSnapshot, exitOnError: false },
+  );
 }
 
 /**
@@ -70,6 +72,28 @@ export async function runLongMemEvalForProbe(args: LongMemEvalProbeArgs): Promis
  * the batch input) or unparseable (cross-modal wrote garbage). Both
  * cases are paste-ready in the error message.
  */
+/**
+ * QA-shaped judge dimensions for the nightly probe. The batch judge's
+ * DEFAULT_DIMENSIONS rubric (DEPTH / SOURCING / SPECIFICITY / …) is built
+ * for rich agent responses; LongMemEval hypotheses are deliberately terse
+ * factual answers ("in widget-co") that can never score ≥7 on DEPTH or
+ * SOURCING — so with the default rubric the probe FAILs every night even
+ * when retrieval + answering are perfectly healthy. The probe owns its
+ * invocation of the eval tool and passes dimensions matching the
+ * fixture's QA shape instead.
+ *
+ * NOTE: the `--dimensions` CLI flag splits on commas, so these dimension
+ * descriptions must stay comma-free.
+ */
+export const PROBE_QA_DIMENSIONS: string[] = [
+  // No faithfulness/grounding dimension on purpose: the judge never sees
+  // the haystack, so any accurate detail beyond the terse gold label reads
+  // as "invented" and correct answers fail (verified empirically — a
+  // correct "before + dates" answer scored 4/10 on such a dimension).
+  'CORRECTNESS — Does the hypothesis state the same fact as the expected answer? A terse direct answer is ideal.',
+  'DIRECTNESS — Does it answer THIS question without hedging or padding or answering something else?',
+];
+
 export async function runCrossModalBatchForProbe(
   args: CrossModalProbeArgs,
 ): Promise<{ exitCode: number; summary: CrossModalBatchSummary }> {
@@ -81,6 +105,8 @@ export async function runCrossModalBatchForProbe(
     args.summaryPath,
     '--max-usd',
     String(args.maxUsd),
+    '--dimensions',
+    PROBE_QA_DIMENSIONS.join(','),
     '--yes',
     '--json',
   ]);
