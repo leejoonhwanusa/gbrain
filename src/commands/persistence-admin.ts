@@ -7,6 +7,7 @@ import { isThinClient, loadConfig, toEngineConfig } from '../core/config.ts';
 import { resolveBrainId } from '../core/brain-resolver.ts';
 import { loadMounts } from '../core/brain-registry.ts';
 import { OperationError } from '../core/ops/contract.ts';
+import { bigintToStringReplacer } from '../core/utils.ts';
 import { maybeDelegateLocalAdministration, persistenceConfigForBrain } from '../core/persistence/local-client.ts';
 import { runPersistenceAdministration } from '../core/persistence/administration.ts';
 import type { PersistenceAdminOperation } from '../core/persistence/admin-contract.ts';
@@ -40,6 +41,10 @@ A revoked CLI cannot replace itself through a running owner. Stop that owner and
 explicitly register --replace locally to authorize a new principal.`;
 
 type Group = 'writer' | 'local-writer';
+export function renderPersistenceAdminResult(result: unknown): string {
+  return JSON.stringify(result, bigintToStringReplacer, 2) + '\n';
+}
+
 export function parsePersistenceAdminArgs(group: Group, args: string[]): {
   operation: PersistenceAdminOperation; params: Record<string, unknown>; brain?: string; json: boolean;
 } {
@@ -125,7 +130,7 @@ export async function runPersistenceAdminCli(group: Group, args: string[], conne
       }
       result = await runPersistenceAdministration(connected ?? owned!, parsed.operation, parsed.params);
     }
-    await writeStdoutFinal(JSON.stringify(result, null, 2) + '\n');
+    await writeStdoutFinal(renderPersistenceAdminResult(result));
   } catch (error) {
     if (!await reportPersistenceCliError(error, args.includes('--json'))) {
       console.error(error instanceof Error ? error.message : String(error));

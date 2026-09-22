@@ -262,7 +262,9 @@ and recovery storage including withdrawal mirrors. Capacity entries show the
 configured limit, remaining reservation and the exact configuration key to
 adjust; usage at or above 80% includes expansion guidance. Blocked requests carry
 a concrete next action. Diagnostics contain no request content, credentials or
-private checkout paths.
+private checkout paths. Database integer counters and epochs are emitted as
+decimal JSON strings so values remain lossless beyond JavaScript's safe integer
+range.
 
 ## Source lifecycle
 

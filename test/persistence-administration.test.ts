@@ -13,7 +13,7 @@ import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { readLocalWriter, registerLocalWriter, revokeLocalWriter, verifyLocalWriter, persistenceHome } from '../src/core/persistence/identity.ts';
 import { startPersistenceIpcServer, requestPersistenceAdministration, requestPersistenceCapabilities, persistenceSocketPathForConfig } from '../src/core/persistence/ipc.ts';
 import { acquireLock, releaseLock } from '../src/core/pglite-lock.ts';
-import { parsePersistenceAdminArgs } from '../src/commands/persistence-admin.ts';
+import { parsePersistenceAdminArgs, renderPersistenceAdminResult } from '../src/commands/persistence-admin.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
@@ -32,6 +32,17 @@ async function isolated<T>(run: (dir: string) => Promise<T>): Promise<T> {
 }
 
 describe('local writer administration', () => {
+  test('persistence administration JSON preserves bigint fields as decimal strings', () => {
+    const rendered = renderPersistenceAdminResult({
+      binding: { owner_epoch: 2n },
+      counters: [{ terminal_bytes: 9_007_199_254_740_993n }],
+    });
+
+    expect(rendered).toBe(
+      '{\n  "binding": {\n    "owner_epoch": "2"\n  },\n  "counters": [\n    {\n      "terminal_bytes": "9007199254740993"\n    }\n  ]\n}\n',
+    );
+  });
+
   test('registration grants validate and replacement revokes the old credential without returning secrets', () => isolated(async () => {
     const first = await runPersistenceAdministration(engine, 'local_writer_register', { lane: 'cli' });
     const old = await readLocalWriter(engine, 'cli');
