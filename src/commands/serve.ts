@@ -1,7 +1,12 @@
 import { spawnSync } from 'node:child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { isEngineDegraded as isEngineDegradedForServe } from '../core/degraded-marker.ts';
-import { startMcpServer, stdioRpcsInFlightCount, resolveMcpStdioSourceScope } from '../mcp/server.ts';
+import {
+  startMcpServer,
+  stdioRpcsInFlightCount,
+  resolveMcpStdioSourceScope,
+  type StdioLifecycle,
+} from '../mcp/server.ts';
 import { VERB_NAMES } from '../core/verbs.ts';
 import { redirectStdoutLoggingToStderr } from '../core/console-prefix.ts';
 import {
@@ -29,6 +34,9 @@ const loadSyncRunner = (): Promise<ServeSyncRunnerModule> => import('../core/ser
 // already covered by the in-process stale-lock check (acquireLock walks
 // the dir, sees a dead PID, and removes it).
 const CLEANUP_DEADLINE_MS = 5_000;
+// Reserve the first half of the shutdown deadline for MCP-owned resources;
+// engine.disconnect still gets the second half even if a cleanup never settles.
+const CLEANUP_DRAIN_BUDGET_MS = Math.floor(CLEANUP_DEADLINE_MS / 2);
 
 // Boot-readiness deadline (#3273). A serve process that wedges mid-boot
 // (e.g. an MCP boot step that never completes because a configured
@@ -77,7 +85,11 @@ export interface ServeOptions {
   // (which unconditionally attaches a 'data' listener to real
   // process.stdin and would pollute the test runner's stdin handle).
   // Defaults to the real implementation when omitted.
-  startMcpServer?: (engine: BrainEngine, opts?: { surface?: 'verbs' | 'starter' | 'full'; sourceGuard?: boolean }) => Promise<void>;
+  startMcpServer?: (
+    engine: BrainEngine,
+    opts?: { surface?: 'verbs' | 'starter' | 'full'; sourceGuard?: boolean },
+    lifecycle?: StdioLifecycle,
+  ) => Promise<void>;
   // Test seam for the parent-process watchdog. The default
   // (`readLiveParentPid`) reads the live kernel PPID via `ps` on POSIX
   // because `process.ppid` is captured at process creation and does not
@@ -334,7 +346,7 @@ export async function runServe(
   // the MCP client log "Failed to parse JSONRPC message" for every line.
   redirectStdoutLoggingToStderr();
 
-  const activateStdioIdleActivityTracking = installStdioLifecycle(engine, args, opts);
+  const { lifecycle, activateIdleActivityTracking } = installStdioLifecycle(engine, args, opts);
 
   const start = opts.startMcpServer ?? startMcpServer;
 
@@ -370,13 +382,13 @@ export async function runServe(
   }
 
   try {
-    await start(engine, { surface, ...(sourceGuard ? { sourceGuard } : {}) });
+    await start(engine, { surface, ...(sourceGuard ? { sourceGuard } : {}) }, lifecycle);
     // `--stdio-idle-timeout` arms its timer during lifecycle installation,
     // but its stdin activity listener must wait until startMcpServer has
     // attached the MCP SDK transport listener. Attaching any `data` listener
     // earlier flips stdin into flowing mode and can consume a fast client's
     // initialize frame before the SDK sees it.
-    activateStdioIdleActivityTracking();
+    activateIdleActivityTracking();
   } finally {
     if (bootDeadline) clearTimeout(bootDeadline);
   }
@@ -435,11 +447,16 @@ interface StdioLifecycleDeps {
   probeWatchdog: () => boolean;
 }
 
+interface InstalledStdioLifecycle {
+  lifecycle: StdioLifecycle;
+  activateIdleActivityTracking(): void;
+}
+
 function installStdioLifecycle(
   engine: BrainEngine,
   args: string[],
   opts: ServeOptions,
-): () => void {
+): InstalledStdioLifecycle {
   const deps: StdioLifecycleDeps = {
     stdin: opts.stdin ?? process.stdin,
     signals: opts.signals ?? process,
@@ -451,10 +468,17 @@ function installStdioLifecycle(
     probeWatchdog: opts.probeWatchdog ?? probeWatchdogAvailable,
   };
 
+  const registeredCleanups: Array<() => void | Promise<void>> = [];
   let shuttingDown = false;
+  let exitIssued = false;
   let parentWatchdog: unknown = null;
   let idleSweepTimer: unknown = null;
   let activateIdleActivityTracking = (): void => {};
+  const finishExit = (): void => {
+    if (exitIssued) return;
+    exitIssued = true;
+    deps.exit(0);
+  };
   const beginShutdown = (reason: string): void => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -496,17 +520,40 @@ function installStdioLifecycle(
         deps.log(
           `GBrain MCP server: cleanup deadline (${ms}ms) exceeded — forcing exit`,
         );
-        deps.exit(0);
+        finishExit();
       }, ms);
       deadline.unref?.();
     };
     armDeadline(CLEANUP_DEADLINE_MS);
 
+    const cleanupDrain = Promise.all(
+      registeredCleanups.map((cleanup) =>
+        Promise.resolve()
+          .then(cleanup)
+          .catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            deps.log(`GBrain MCP server: cleanup error: ${msg}`);
+          }),
+      ),
+    );
+    let cleanupDrainTimer: ReturnType<typeof setTimeout> | null = null;
+    const cleanupDrainDeadline = new Promise<void>((resolve) => {
+      cleanupDrainTimer = setTimeout(() => {
+        deps.log(
+          `GBrain MCP server: cleanup drain deadline (${CLEANUP_DRAIN_BUDGET_MS}ms) exceeded — continuing with delegated-sync shutdown and engine disconnect`,
+        );
+        resolve();
+      }, CLEANUP_DRAIN_BUDGET_MS);
+      cleanupDrainTimer.unref?.();
+    });
+
     Promise.resolve()
-      // Idempotent shared promise — mcp/server.ts's shutdown races here on
-      // the same signals; whichever runs first does the abort+settle, the
-      // other awaits it. Must precede disconnect (settle writes need the
-      // live engine; the disconnect-mode drain is allowAbort:false).
+      .then(async () => {
+        await Promise.race([cleanupDrain, cleanupDrainDeadline]);
+        if (cleanupDrainTimer !== null) clearTimeout(cleanupDrainTimer);
+      })
+      // Must precede disconnect: the delegated sync's final checkpoint and
+      // row-lock release need the live engine.
       .then(() => loadSyncRunner())
       .then((runner) => {
         if (runner.isDelegatedSyncRunning()) {
@@ -522,8 +569,15 @@ function installStdioLifecycle(
       })
       .finally(() => {
         if (deadline) clearTimeout(deadline);
-        deps.exit(0);
+        finishExit();
       });
+  };
+
+  const lifecycle: StdioLifecycle = {
+    requestShutdown: beginShutdown,
+    registerCleanup: (cleanup) => {
+      registeredCleanups.push(cleanup);
+    },
   };
 
   // Signal-based termination. SIGTERM: daemon ask. SIGINT: user Ctrl-C.
@@ -748,7 +802,7 @@ function installStdioLifecycle(
     deps.log(`GBrain MCP server: stdio idle timeout = ${idleTimeoutSec}s`);
   }
 
-  return activateIdleActivityTracking;
+  return { lifecycle, activateIdleActivityTracking };
 }
 
 /**

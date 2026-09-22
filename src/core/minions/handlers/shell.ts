@@ -267,6 +267,10 @@ export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResul
   }
 
   const pid = proc.pid ?? -1;
+  // Keep the exact ChildProcess object for the full abort sequence. The
+  // `.killed` flag only records that a signal was sent; it becomes true before
+  // the child exits and therefore cannot be used as a liveness check.
+  const child = proc;
   const stdoutTail = new TailBuffer(STDOUT_TAIL_MAX_BYTES);
   const stderrTail = new TailBuffer(STDERR_TAIL_MAX_BYTES);
 
@@ -282,12 +286,12 @@ export async function shellHandler(ctx: MinionJobContext): Promise<ShellJobResul
   const onAbort = (label: string) => () => {
     if (killTimer !== null) return; // already started
     killReason = label;
-    if (!proc.killed) {
-      try { proc.kill('SIGTERM'); } catch { /* proc already exited */ }
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGTERM'); } catch { /* proc already exited */ }
     }
     killTimer = setTimeout(() => {
-      if (!proc.killed) {
-        try { proc.kill('SIGKILL'); } catch { /* already exited */ }
+      if (child.exitCode === null && child.signalCode === null) {
+        try { child.kill('SIGKILL'); } catch { /* already exited */ }
       }
     }, KILL_GRACE_MS);
   };

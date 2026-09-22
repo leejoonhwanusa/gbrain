@@ -371,6 +371,53 @@ describe('runServe stdio lifecycle', () => {
     expect(h.engine.disconnectCalls).toBe(1);
   });
 
+  test('transport close and SIGTERM share one cleanup owner and ordering', async () => {
+    const h = makeHarness();
+    const events: string[] = [];
+    const originalExit = h.opts.exit!;
+    h.opts.exit = (code?: number) => {
+      events.push(`exit:${code ?? 0}`);
+      originalExit(code);
+    };
+    h.engine.disconnect = async () => {
+      events.push('disconnect');
+      h.engine.disconnectCalls += 1;
+    };
+    h.opts.startMcpServer = async (
+      _engine: BrainEngine,
+      _opts,
+      lifecycle?: {
+        requestShutdown: (reason: string) => void;
+        registerCleanup: (cleanup: () => void | Promise<void>) => void;
+      },
+    ) => {
+      // Keep this optional so the seam remains assignable to the production
+      // signature while the assertion still proves lifecycle delivery.
+      if (!lifecycle) return;
+      lifecycle.registerCleanup(async () => {
+        events.push('cleanup');
+      });
+      // A stuck resource must not prevent the coordinator from invoking the
+      // next teardown stage within the bounded shutdown deadline.
+      lifecycle.registerCleanup(() => new Promise<void>(() => {}));
+      lifecycle.requestShutdown('transport-close');
+      h.signals.emit('SIGTERM');
+    };
+
+    await startInBackground(h.engine, [], h.opts);
+    // Also deliver a signal after startup; the coordinator must absorb it
+    // while the transport-close shutdown is already draining.
+    h.signals.emit('SIGTERM');
+
+    const code = await h.exited;
+    expect(code).toBe(0);
+    expect(events.filter(e => e === 'cleanup')).toHaveLength(1);
+    expect(events.filter(e => e === 'disconnect')).toHaveLength(1);
+    expect(events.filter(e => e === 'exit:0')).toHaveLength(1);
+    expect(events).toEqual(['cleanup', 'disconnect', 'exit:0']);
+    expect(h.engine.disconnectCalls).toBe(1);
+  });
+
   test('TTY stdin does NOT install end watcher (interactive use unaffected)', async () => {
     const h = makeHarness({ isTTY: true });
     await startInBackground(h.engine, [], h.opts);

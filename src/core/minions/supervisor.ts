@@ -27,6 +27,7 @@
  */
 
 import { detectTini } from './spawn-helpers.ts';
+import { installSupervisorLifecycleStdin } from './detached-stderr.ts';
 import { resolveDefaultMaxRssMb } from './rss-default.ts';
 import {
   ChildWorkerSupervisor,
@@ -89,6 +90,12 @@ export interface SupervisorOpts {
   allowShellJobs: boolean;
   /** JSON mode: emit JSONL events on stderr, reserve stdout for data payloads. Default: false. */
   json: boolean;
+  /**
+   * Opt-in parent-lifetime contract. When true, EOF/close on stdin requests
+   * the same graceful shutdown as SIGTERM. Default: false so ordinary CLI
+   * supervisors never change their stdin behavior.
+   */
+  lifecycleStdin: boolean;
   /** RSS threshold (MB) passed to the spawned worker as `--max-rss N`.
    *  When omitted, the constructor auto-sizes cgroup-aware via
    *  resolveDefaultMaxRssMb() (issue #1678) instead of a flat default.
@@ -140,6 +147,15 @@ export interface SupervisorOpts {
   _backoffFloorMs?: number;
 }
 
+/** Parse and validate the opt-in parent-lifetime contract for supervisors. */
+export function parseLifecycleStdinFlag(args: string[]): boolean {
+  return args.includes('--lifecycle-stdin');
+}
+
+export function hasLifecycleStdinDetachConflict(args: string[]): boolean {
+  return parseLifecycleStdinFlag(args) && args.includes('--detach');
+}
+
 export const DEFAULT_PID_FILE: string = (() => {
   const envOverride = process.env.GBRAIN_SUPERVISOR_PID_FILE;
   if (envOverride && envOverride.length > 0) return envOverride;
@@ -162,6 +178,7 @@ const DEFAULTS: Omit<SupervisorOpts, 'cliPath'> = {
   healthInterval: 60_000,
   allowShellJobs: false,
   json: false,
+  lifecycleStdin: false,
   maxRssMb: 2048,
   // issue #1801 progress-watchdog defaults. Conservative: a dead-pool wedge is
   // caught faster by the worker's own DB probe (fix #2, ~3 min); this 15-min
@@ -558,11 +575,14 @@ export class MinionSupervisor {
   private exitListener: (() => void) | null = null;
   private sigtermListener: (() => void) | null = null;
   private sigintListener: (() => void) | null = null;
+  private removeLifecycleStdin: (() => void) | null = null;
   private lockAcquired = false;
   private consecutiveHealthFailures = 0;
   // #1849: queue-scoped DB singleton lock (the real authority) + its refresh
   // timer and consecutive-failure counter (fail-safe exit before TTL lapse).
   private dbLock: DbLockHandle | null = null;
+  private dbLockAcquisition: Promise<void> | null = null;
+  private dbLockWaitAbort: AbortController | null = null;
   private lockRefreshTimer: ReturnType<typeof setInterval> | null = null;
   private lockRefreshFailures = 0;
   // issue #1801 progress-watchdog state.
@@ -692,6 +712,10 @@ export class MinionSupervisor {
 
   /** Start the supervisor. Blocks until stopped or max crashes exceeded. */
   async start(): Promise<void> {
+    // Observe the parent-lifetime contract before any PID/DB lock work. A
+    // parent can close stdin while DB singleton acquisition is still waiting.
+    this.attachLifecycleStdin();
+    try {
     // 1. PID file lock (atomic via O_CREAT|O_EXCL).
     const lockResult = this.acquirePidLock();
     if (lockResult === 'held') {
@@ -727,7 +751,10 @@ export class MinionSupervisor {
     // above but loses here, so it can't run a conflicting --max-rss worker on
     // the same (db, queue). Keyed on the queue alone; the database half of the
     // mutex is physical (the lock row lives in this DB).
-    this.dbLock = await tryAcquireDbLock(this.engine, this.supervisorLockId(), SUPERVISOR_LOCK_TTL_MIN);
+    await this.acquireDbLock(
+      tryAcquireDbLock(this.engine, this.supervisorLockId(), SUPERVISOR_LOCK_TTL_MIN),
+    );
+    if (this.stopping) return;
     if (!this.dbLock) {
       // #2308: a DEAD holder on ANOTHER host leaves a row whose TTL is still
       // live — tryAcquireDbLock correctly refuses to steal it (cross_host),
@@ -754,12 +781,14 @@ export class MinionSupervisor {
           `process on another host). Waiting up to ${waitSeconds > 0 ? waitSeconds : 'TTL+grace'}s ` +
           `for the holder to expire or heartbeat; set GBRAIN_SUPERVISOR_LOCK_WAIT_SECONDS=0 to exit immediately.`,
         );
-        this.dbLock = await waitForDbLockTakeover(
+        this.dbLockWaitAbort = new AbortController();
+        await this.acquireDbLock(waitForDbLockTakeover(
           this.engine,
           this.supervisorLockId(),
           SUPERVISOR_LOCK_TTL_MIN,
           {
             ...(waitSeconds > 0 ? { maxWaitMs: waitSeconds * 1000 } : {}),
+            signal: this.dbLockWaitAbort.signal,
             onWait: ({ snapshot, waitedMs, maxWaitMs }) => {
               const holder = snapshot
                 ? `pid=${snapshot.holder_pid} host=${snapshot.holder_host}`
@@ -770,7 +799,9 @@ export class MinionSupervisor {
               );
             },
           },
-        );
+        ));
+        this.dbLockWaitAbort = null;
+        if (this.stopping) return;
         if (this.dbLock) {
           console.error(`[supervisor] queue lock '${this.opts.queue}' taken over from expired holder.`);
         }
@@ -827,9 +858,33 @@ export class MinionSupervisor {
     // 6. Derive the claimable job-name set for the wedge watchdog (issue #1801).
     //    Done before the loop so the first health check can scope correctly.
     await this.deriveHandlerNames();
+    if (this.stopping) return;
 
     // 7. Run the supervise loop (respawn on crash, bounded by maxCrashes).
     await this.runSuperviseLoop();
+    } finally {
+      this.detachLifecycleStdin();
+    }
+  }
+
+  /**
+   * Bind the optional parent-lifetime pipe. The listener never inspects or
+   * stores stdin data; only stream termination is meaningful. Bun needs the
+   * stream put into flowing mode for a pipe EOF to surface, while Node's
+   * paused Readable can observe the same EOF with a zero-byte read.
+   */
+  private attachLifecycleStdin(input: NodeJS.ReadStream = process.stdin): void {
+    if (!this.opts.lifecycleStdin || this.removeLifecycleStdin) return;
+    this.removeLifecycleStdin = installSupervisorLifecycleStdin(
+      input,
+      () => { void this.shutdown('stdin_eof', ExitCodes.CLEAN); },
+    );
+  }
+
+  /** Remove the optional stdin listeners as soon as shutdown begins. */
+  private detachLifecycleStdin(): void {
+    this.removeLifecycleStdin?.();
+    this.removeLifecycleStdin = null;
   }
 
   /**
@@ -901,6 +956,8 @@ export class MinionSupervisor {
     if (this.stopping) return;
     this.stopping = true;
 
+    this.detachLifecycleStdin();
+
     this.emit('shutting_down', { reason, exit_code: exitCode });
 
     if (this.healthTimer) {
@@ -911,15 +968,13 @@ export class MinionSupervisor {
     // #1849: stop refreshing + release the DB singleton lock so a clean
     // restart (or a different host) can re-acquire immediately instead of
     // waiting out the TTL. release() is best-effort; the TTL covers a crash.
-    if (this.lockRefreshTimer) {
-      clearInterval(this.lockRefreshTimer);
-      this.lockRefreshTimer = null;
+    this.dbLockWaitAbort?.abort();
+    this.dbLockWaitAbort = null;
+    const pendingDbLock = this.dbLockAcquisition;
+    if (pendingDbLock) {
+      try { await pendingDbLock; } catch { /* acquisition failure owns no lock */ }
     }
-    if (this.dbLock) {
-      const lock = this.dbLock;
-      this.dbLock = null;
-      try { await lock.release(); } catch { /* best-effort; TTL fallback covers it */ }
-    }
+    await this.releaseDbLock();
 
     if (this.childSupervisor) {
       this.childSupervisor.killChild('SIGTERM');
@@ -944,6 +999,36 @@ export class MinionSupervisor {
 
     this.emit('stopped', { reason, exit_code: exitCode });
     process.exit(exitCode);
+  }
+
+  /** Release a current or late-acquired singleton lock exactly once. */
+  private async releaseDbLock(): Promise<void> {
+    if (this.lockRefreshTimer) {
+      clearInterval(this.lockRefreshTimer);
+      this.lockRefreshTimer = null;
+    }
+    const lock = this.dbLock;
+    this.dbLock = null;
+    if (lock) {
+      try { await lock.release(); } catch { /* best-effort; TTL fallback covers it */ }
+    }
+  }
+
+  /** Adopt a lock only while starting; shutdown drains and releases late wins. */
+  private async acquireDbLock(acquisition: Promise<DbLockHandle | null>): Promise<void> {
+    const settlement = acquisition.then(async (lock) => {
+      if (this.stopping) {
+        if (lock) try { await lock.release(); } catch { /* TTL fallback */ }
+      } else {
+        this.dbLock = lock;
+      }
+    });
+    this.dbLockAcquisition = settlement;
+    try {
+      await settlement;
+    } finally {
+      if (this.dbLockAcquisition === settlement) this.dbLockAcquisition = null;
+    }
   }
 
   /** #1849: the queue-scoped DB lock id for this supervisor's queue. */

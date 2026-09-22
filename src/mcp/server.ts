@@ -174,7 +174,16 @@ export async function trackStdioRpc<T>(work: () => Promise<T>): Promise<T> {
   }
 }
 
-export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpSurface; sourceGuard?: boolean } = {}) {
+export interface StdioLifecycle {
+  requestShutdown(reason: string): void;
+  registerCleanup(cleanup: () => void | Promise<void>): void;
+}
+
+export async function startMcpServer(
+  engine: BrainEngine,
+  opts: { surface?: McpSurface; sourceGuard?: boolean } = {},
+  lifecycle?: StdioLifecycle,
+) {
   const config = loadConfig();
   // Refuse to serve a well-formed GBRAIN_SOURCE that no active source row
   // backs (see source-preflight.ts). Throws before any transport is attached.
@@ -316,7 +325,27 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     });
   }));
 
+  let shuttingDown = false;
+  let ipcBinding: { close: () => void } | null = null;
+  let startupSweep: { cancel: () => void } | null = null;
+  if (lifecycle) {
+    lifecycle.registerCleanup(async () => {
+      shuttingDown = true;
+      try { startupSweep?.cancel(); } catch { /* noop */ }
+      ipcBinding?.close();
+      await import('../core/context/checkpoint-harvest.ts')
+        .then((m) => m.shutdownCheckpointHarvest());
+    });
+  }
+
   const transport = new StdioServerTransport();
+  if (lifecycle) {
+    // @ts-ignore — SDK exposes onclose on transport
+    transport.onclose = () => {
+      shuttingDown = true;
+      lifecycle.requestShutdown('transport-close');
+    };
+  }
   await server.connect(transport);
 
   // Engine-dependent boot: the resolve-IPC listener, session-cursor GC, and
@@ -324,8 +353,6 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // (db-availability 4c) they are DEFERRED until the first successful
   // reconnect — running them against a dead engine would burn reconnect
   // attempts on background work instead of tool calls.
-  let ipcBinding: { close: () => void } | null = null;
-  let startupSweep: { cancel: () => void } | null = null;
   const bootEngineDependents = async (): Promise<void> => {
     // Retrieval Reflex (#1981, D9=C): the resolve/turn_context/context_pack
     // (+ delegated sync/sweep) IPC listener. Wiring shared with `serve --http`
@@ -376,10 +403,15 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     await bootEngineDependents();
   }
 
-  // Exit cleanly when MCP client disconnects (stdin EOF) or on signals.
+  // runServe owns stdio lifecycle coordination when provided. This module
+  // only registers the resources it created; delegated-sync shutdown and the
+  // engine disconnect remain ordered by that single coordinator.
+  if (lifecycle) return;
+
+  // Backward-compatible direct-call fallback: exit cleanly when the MCP
+  // client disconnects or a signal arrives.
   // Without this, orphaned serve processes accumulate and contend for the
   // PGLite write lock, causing ingest jobs (email-sync) to time out.
-  let shuttingDown = false;
   const shutdown = (reason: string, code = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;

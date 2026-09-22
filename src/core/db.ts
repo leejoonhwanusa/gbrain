@@ -20,6 +20,13 @@ let connectedUrl: string | null = null;
 export const POOL_END_TIMEOUT_SECONDS = 2;
 
 /**
+ * The module singleton is refreshed by the MinionSupervisor every 60 seconds.
+ * Keep this idle timeout above that cadence so Bun does not tear down and
+ * recreate SCRAM crypto worker threads on each normal refresh.
+ */
+const MODULE_POOL_IDLE_TIMEOUT_SECONDS = 120;
+
+/**
  * #1972: end a postgres.js pool with a gbrain-owned hard bound. Resolves as soon
  * as `.end()` settles OR after POOL_END_TIMEOUT_SECONDS + a small slack — so
  * teardown never hangs (the prior bare `.end()` blocked until the CLI's 10s
@@ -283,12 +290,13 @@ export async function connect(config: EngineConfig): Promise<boolean> {
     );
   }
 
+  let createdPool: ReturnType<typeof postgres> | null = null;
   try {
     const prepare = resolvePrepare(url);
     const timeouts = resolveSessionTimeouts();
     const opts: Record<string, unknown> = {
       max: resolvePoolSize(),
-      idle_timeout: 20,
+      idle_timeout: MODULE_POOL_IDLE_TIMEOUT_SECONDS,
       connect_timeout: 10,
       // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
       max_lifetime: resolveMaxLifetimeSeconds(),
@@ -313,17 +321,34 @@ export async function connect(config: EngineConfig): Promise<boolean> {
         );
       }
     }
-    sql = postgres(url, opts);
+    createdPool = postgres(url, opts);
+    sql = createdPool;
 
     // Test connection
-    await sql`SELECT 1`;
+    await createdPool`SELECT 1`;
+    if (sql !== createdPool) {
+      await endPoolBounded(createdPool);
+      return false;
+    }
     connectedUrl = url;
 
-    await setSessionDefaults(sql);
+    await setSessionDefaults(createdPool);
+    if (sql !== createdPool) {
+      await endPoolBounded(createdPool);
+      return false;
+    }
     return true; // we created the singleton — caller is the owner
   } catch (e: unknown) {
-    sql = null;
-    connectedUrl = null;
+    // Only clear the globals if this failed attempt still owns the module
+    // reference. A concurrent disconnect/connect may have installed a
+    // replacement while the connection test was awaiting I/O.
+    if (createdPool) {
+      if (sql === createdPool) {
+        sql = null;
+        connectedUrl = null;
+      }
+      await endPoolBounded(createdPool);
+    }
     const msg = e instanceof Error ? e.message : String(e);
     throw new GBrainError(
       'Cannot connect to database',

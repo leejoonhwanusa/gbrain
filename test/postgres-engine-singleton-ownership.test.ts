@@ -52,6 +52,43 @@ describe('postgres-engine / module-singleton ownership (#1471)', () => {
     expect(/return true/.test(connect)).toBe(true);
   });
 
+  test('module pool outlives the supervisor cadence and failed creation is identity-safe and bounded', () => {
+    const connect = stripComments(extractFn(DB_SRC, 'connect'));
+    const timeout = /const\s+MODULE_POOL_IDLE_TIMEOUT_SECONDS\s*=\s*(\d+)/.exec(DB_SRC);
+    expect(timeout).not.toBeNull();
+    expect(Number(timeout?.[1])).toBeGreaterThan(60);
+    expect(/idle_timeout\s*:\s*MODULE_POOL_IDLE_TIMEOUT_SECONDS/.test(connect)).toBe(true);
+
+    expect(/let\s+createdPool\s*:\s*ReturnType<typeof postgres>\s*\|\s*null\s*=\s*null/.test(connect)).toBe(true);
+    expect(/createdPool\s*=\s*postgres\(url,\s*opts\)/.test(connect)).toBe(true);
+    expect(/if\s*\(\s*sql\s*===\s*createdPool\s*\)\s*\{[\s\S]*?sql\s*=\s*null/.test(connect)).toBe(true);
+    expect(/await\s+endPoolBounded\(createdPool\)/.test(connect)).toBe(true);
+
+    const endIdx = connect.search(/await\s+endPoolBounded\(createdPool\)/);
+    const errorIdx = connect.search(/const\s+msg\s*=/);
+    expect(endIdx).toBeGreaterThanOrEqual(0);
+    expect(errorIdx).toBeGreaterThan(endIdx);
+
+    const selectIdx = connect.search(/await\s+createdPool`SELECT 1`/);
+    const urlIdx = connect.search(/connectedUrl\s*=\s*url/);
+    const defaultsIdx = connect.search(/await\s+setSessionDefaults\(createdPool\)/);
+    const staleMatches = [...connect.matchAll(/if\s*\(\s*sql\s*!==\s*createdPool\s*\)\s*\{([\s\S]*?)\}/g)];
+    expect(selectIdx).toBeGreaterThanOrEqual(0);
+    expect(urlIdx).toBeGreaterThan(selectIdx);
+    expect(defaultsIdx).toBeGreaterThan(urlIdx);
+    expect(staleMatches.length).toBe(2);
+    for (const match of staleMatches) {
+      const staleBody = match[1] ?? '';
+      expect(/await\s+endPoolBounded\(createdPool\)/.test(staleBody)).toBe(true);
+      expect(/return false/.test(staleBody)).toBe(true);
+      // A stale creator must not clear a replacement pool or its URL.
+      expect(/\bsql\s*=\s*null|connectedUrl\s*=\s*null/.test(staleBody)).toBe(false);
+    }
+    expect((staleMatches[0]?.index ?? -1)).toBeGreaterThan(selectIdx);
+    expect((staleMatches[0]?.index ?? -1)).toBeLessThan(urlIdx);
+    expect((staleMatches[1]?.index ?? -1)).toBeGreaterThan(defaultsIdx);
+  });
+
   test('PostgresEngine tracks module-singleton ownership with a dedicated flag', () => {
     expect(ENGINE_SRC.includes('_ownsModuleSingleton')).toBe(true);
   });

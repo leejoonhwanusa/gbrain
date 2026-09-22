@@ -75,6 +75,24 @@ export function buildDetachedSupervisorArgs(cliScript: string, childArgs: string
     : [cliScript, ...childArgs];
 }
 
+/** Install an EOF-only parent-lifetime contract and return its remover. */
+export function installSupervisorLifecycleStdin(
+  input: NodeJS.ReadStream,
+  onClosed: () => void,
+): () => void {
+  input.on('end', onClosed);
+  input.on('close', onClosed);
+  if (typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined') {
+    input.resume();
+  } else {
+    input.read(0);
+  }
+  return () => {
+    input.removeListener('end', onClosed);
+    input.removeListener('close', onClosed);
+  };
+}
+
 /**
  * Re-exec the CLI as a fully detached supervisor: stdin/stdout ignored,
  * stderr on the durable sink (NEVER 'inherit' — the #4418 regression).

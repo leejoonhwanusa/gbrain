@@ -258,6 +258,17 @@ describe('shell handler: abort', () => {
     ));
     await expect(promise).rejects.toThrow(/aborted/);
   });
+  test('SIGTERM-ignoring ChildProcess remains eligible for SIGKILL escalation', () => {
+    // A SIGTERM-ignoring child cannot be spawned portably by this Windows
+    // test runner. Pin the two signal gates structurally so a fake child with
+    // killed=true but exitCode/signalCode still null follows both calls.
+    const source = fs.readFileSync(path.join(import.meta.dir, '..', 'src', 'core', 'minions', 'handlers', 'shell.ts'), 'utf8');
+    const abortBody = source.slice(source.indexOf('const onAbort'), source.indexOf('const sigAbort'));
+    expect(abortBody).toContain('child.exitCode === null && child.signalCode === null');
+    expect(abortBody).toContain("child.kill('SIGTERM')");
+    expect(abortBody).toContain("child.kill('SIGKILL')");
+    expect(abortBody).not.toContain('.killed');
+  });
 });
 
 // ---- shell-audit: ISO-week filename ----------------------------------------

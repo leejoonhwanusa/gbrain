@@ -387,6 +387,8 @@ export interface WaitForTakeoverOpts {
   onWait?: (info: { snapshot: LockSnapshot | null; waitedMs: number; maxWaitMs: number }) => void;
   /** Test seam: sleep implementation (default setTimeout). */
   sleep?: (ms: number) => Promise<void>;
+  /** Stop waiting; a concurrently acquired handle is released before return. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -421,6 +423,7 @@ export async function waitForDbLockTakeover(
   const start = Date.now();
 
   let baseline: LockSnapshot | null = null;
+  if (opts.signal?.aborted) return null;
   try {
     baseline = await inspectLock(engine, lockId);
   } catch {
@@ -429,7 +432,12 @@ export async function waitForDbLockTakeover(
 
   for (;;) {
     const handle = await tryAcquireDbLock(engine, lockId, ttlMinutes);
-    if (handle) return handle;
+    if (handle) {
+      if (!opts.signal?.aborted) return handle;
+      try { await handle.release(); } catch { /* TTL remains the fallback */ }
+      return null;
+    }
+    if (opts.signal?.aborted) return null;
 
     let snap: LockSnapshot | null = null;
     try {
@@ -455,7 +463,16 @@ export async function waitForDbLockTakeover(
     const waitedMs = Date.now() - start;
     if (waitedMs >= maxWaitMs) return null;
     opts.onWait?.({ snapshot: snap, waitedMs, maxWaitMs });
-    await sleep(Math.min(pollMs, maxWaitMs - waitedMs));
+    const delay = sleep(Math.min(pollMs, maxWaitMs - waitedMs));
+    if (!opts.signal) {
+      await delay;
+    } else {
+      let wake!: EventListener;
+      const aborted = new Promise<void>((resolve) => { wake = () => resolve(); opts.signal!.addEventListener('abort', wake, { once: true }); });
+      await Promise.race([delay, aborted]);
+      opts.signal.removeEventListener('abort', wake);
+      if (opts.signal.aborted) return null;
+    }
   }
 }
 

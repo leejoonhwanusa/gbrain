@@ -38,6 +38,15 @@ failure. The doctor's separate temporary on-disk probe is unchanged.
 - Keep Windows supervisor restarts on the same brain-scoped PID file when
   `HOME` is absent, and omit Bun's virtual entrypoint when a compiled binary
   re-execs the detached supervisor.
+- Let foreground supervisors opt into parent-lifetime stdin ownership; EOF now
+  cancels lock takeover, drains late acquisition, and releases the lock before
+  exit, while detached supervisors keep their existing ownership model.
+- Give stdio MCP shutdown one coordinator for transport resources, delegated
+  sync settlement, and engine disconnect; cleanup remains bounded and
+  idempotent when EOF, signals, and transport close race.
+- Keep the shared Postgres pool alive across the normal supervisor refresh
+  cadence, retire stale concurrent pool creators safely, and preserve SIGKILL
+  escalation for children that ignore SIGTERM.
 - Let read-only skill discovery recover the adjacent source checkout from a
   compiled executable path when `import.meta.url` is virtual, while rejecting
   checkout-external skill symlinks and leaving write-path routing unchanged.

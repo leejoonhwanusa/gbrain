@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, spyOn } from 'bun:test';
+import { EventEmitter } from 'events';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, chmodSync, mkdirSync, rmSync } from 'fs';
 import { spawn } from 'child_process';
 import { join } from 'path';
@@ -117,6 +118,71 @@ async function waitFor(pred: () => boolean, timeoutMs: number, tickMs = 20): Pro
 }
 
 describe('MinionSupervisor', () => {
+  describe('optional parent-lifetime stdin', () => {
+    it('shuts down once on EOF/close and removes both listeners', async () => {
+      const input = new EventEmitter() as EventEmitter & {
+        read: (size?: number) => unknown;
+        resume: () => void;
+      };
+      input.read = () => null;
+      input.resume = () => {};
+
+      const supervisor = new MinionSupervisor({} as BrainEngine, {
+        cliPath: '/bin/sh',
+        lifecycleStdin: true,
+      });
+      const internal = supervisor as unknown as {
+        attachLifecycleStdin: (input: NodeJS.ReadStream) => void;
+      };
+      const exit = spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+      try {
+        internal.attachLifecycleStdin(input as unknown as NodeJS.ReadStream);
+        expect(input.listenerCount('end')).toBe(1);
+        expect(input.listenerCount('close')).toBe(1);
+
+        input.emit('end');
+        input.emit('close');
+        await Promise.resolve();
+
+        expect(exit).toHaveBeenCalledTimes(1);
+        expect(exit).toHaveBeenCalledWith(0);
+        expect(input.listenerCount('end')).toBe(0);
+        expect(input.listenerCount('close')).toBe(0);
+      } finally {
+        exit.mockRestore();
+      }
+    });
+
+    it('drains and releases a DB lock acquired after EOF shutdown starts', async () => {
+      const supervisor = new MinionSupervisor({} as BrainEngine, { cliPath: '/bin/sh' });
+      let resolveLock!: (lock: { release: () => Promise<void> }) => void;
+      const acquisition = new Promise<{ release: () => Promise<void> }>((resolve) => { resolveLock = resolve; });
+      let releases = 0;
+      let finishRelease!: () => void;
+      const internal = supervisor as unknown as {
+        acquireDbLock: (pending: Promise<unknown>) => Promise<void>;
+        shutdown: (reason: string, code: number) => Promise<void>;
+      };
+      const exit = spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+      try {
+        const adopting = internal.acquireDbLock(acquisition);
+        const stopping = internal.shutdown('stdin_eof', 0);
+        resolveLock({ release: () => new Promise<void>((resolve) => { releases += 1; finishRelease = resolve; }) });
+        while (releases === 0) await Promise.resolve();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(exit).not.toHaveBeenCalled();
+        finishRelease();
+        await Promise.all([adopting, stopping]);
+        expect(releases).toBe(1);
+        expect(exit).toHaveBeenCalledTimes(1);
+        expect(exit).toHaveBeenCalledWith(0);
+      } finally {
+        exit.mockRestore();
+      }
+    });
+  });
+
   describe('resolveHardStopMaxCrashes (issue #1994)', () => {
     const KEY = 'GBRAIN_SUPERVISOR_HARD_STOP_CRASHES';
     afterEach(() => { delete process.env[KEY]; });

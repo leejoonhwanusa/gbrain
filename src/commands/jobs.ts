@@ -384,7 +384,7 @@ USAGE
                          [--concurrency N] [--queue Q] [--pid-file PATH]
                          [--max-crashes N] [--health-interval N]
                          [--allow-shell-jobs] [--cli-path PATH]
-                         [--max-rss MB] [--nice N]
+                         [--max-rss MB] [--nice N] [--lifecycle-stdin]
                          [--job-isolation inline|process]
 
     --nice N   OS scheduling priority, -20 (highest) to 19 (nicest). Lowers CPU
@@ -407,7 +407,7 @@ USAGE
     SUBCOMMANDS
       start        (default) Launch the supervisor. --detach returns a
                    JSON {event, supervisor_pid, pid_file} payload on
-                   stdout and forks; omit for foreground.
+                   stdout and forks; omit for foreground. --lifecycle-stdin is foreground-only and stops on stdin EOF.
       status       Read PID file + audit log, report running / last_start
                    / crashes_24h / max_crashes_exceeded as JSON or human.
                    Exits 0 if running, 1 if not.
@@ -499,13 +499,13 @@ USAGE
                          [--concurrency N] [--queue Q] [--pid-file PATH]
                          [--max-crashes N] [--health-interval N]
                          [--allow-shell-jobs] [--cli-path PATH]
-                         [--max-rss MB] [--nice N]
+                         [--max-rss MB] [--nice N] [--lifecycle-stdin]
                          [--job-isolation inline|process]
   gbrain jobs supervisor status [--json] [--pid-file PATH]
   gbrain jobs supervisor stop [--json] [--pid-file PATH]
 
 OPTIONS (start)
-  --detach             Fork and print {event, supervisor_pid, pid_file} JSON
+  --detach             Fork and print JSON; --lifecycle-stdin stops a foreground supervisor on parent EOF
   --json               JSONL lifecycle events on stdout
   --concurrency N      Worker concurrency (default 2)
   --queue Q            Queue to claim from (default: default)
@@ -1801,7 +1801,7 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       //   gbrain jobs supervisor start [--detach]   → foreground or detached start
       //   gbrain jobs supervisor status             → JSON liveness + queue stats
       //   gbrain jobs supervisor stop               → SIGTERM + drain wait
-      const { MinionSupervisor, DEFAULT_PID_FILE } = await import('../core/minions/supervisor.ts');
+      const { MinionSupervisor, DEFAULT_PID_FILE, parseLifecycleStdinFlag, hasLifecycleStdinDetachConflict } = await import('../core/minions/supervisor.ts');
       const { writeSupervisorEvent } = await import('../core/minions/handlers/supervisor-audit.ts');
 
       const supCmd = args[1];
@@ -2002,10 +2002,9 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       const allowShellJobs = hasFlag(args, '--allow-shell-jobs') ||
                              process.env.GBRAIN_ALLOW_SHELL_JOBS === '1'; // same literal the shell handler checks
       const detach = hasFlag(args, '--detach');
-      // Supervisor's --max-rss: explicit wins; absent → cgroup-aware auto-size
-      // (issue #1678). The supervisor is the main production path, so the
-      // watchdog is on by default — but at a realistic, RAM-relative cap
-      // instead of the old flat 2048MB footgun.
+      const lifecycleStdin = parseLifecycleStdinFlag(args); if (hasLifecycleStdinDetachConflict(args)) { console.error('Error: --lifecycle-stdin cannot be combined with --detach.'); process.exit(1); }
+      // Supervisor --max-rss: explicit wins; absent uses a cgroup-aware
+      // RAM-relative cap instead of the old flat 2048MB footgun (#1678).
       const { resolveDefaultMaxRssMb: resolveSupMaxRss } =
         await import('../core/minions/rss-default.ts');
       const maxRssMb = parseMaxRssFlag(args) ?? resolveSupMaxRss();
@@ -2066,6 +2065,7 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
         allowShellJobs,
         json: jsonMode,
         maxRssMb,
+        lifecycleStdin,
         jobIsolation: parseJobIsolationFlag(args),
         ...(supNice !== undefined ? { nice_requested: supNice } : {}),
         ...(supNiceResult?.effective != null ? { nice_effective: supNiceResult.effective } : {}),
