@@ -413,6 +413,16 @@ describe('validateRepoState', () => {
     expect(validateRepoState(p)).toBe('healthy');
   });
 
+  test("managed child directory stays healthy with its parent Git origin", () => {
+    const repo = join(fixtureDir, 'managed-parent');
+    const child = join(repo, 'registered-child');
+    mkdirSync(child, { recursive: true });
+    execFileSync('git', ['-C', repo, 'init', '-q'], { stdio: 'pipe' });
+    const remote = 'https://github.com/example/managed-parent.git';
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', remote], { stdio: 'pipe' });
+    expect(validateRepoState(child, remote)).toBe('healthy');
+  });
+
   test("still returns 'corrupted' when a remote WAS expected but origin is missing (#4559)", () => {
     // Managed-clone semantics preserved: a configured expectedRemoteUrl with
     // no origin remains corruption.
