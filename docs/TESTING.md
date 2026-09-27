@@ -1002,6 +1002,21 @@ permission to run them — see the "run without asking" rule above.
 Never leave `gbrain-test-pg` running. If you find a stale one from a previous run,
 stop and remove it before starting a new one.
 
+### Windows Docker prerequisite
+
+A per-user Docker Desktop installation does not by itself make this E2E gate
+available. Verify that `docker info` reaches a Linux engine; first-time Windows
+virtualization feature setup can require elevation and a restart even though the
+per-user installer does not. See [Docker's Windows permission requirements](https://docs.docker.com/desktop/setup/install/windows-permission-requirements/).
+
+An existing PostgreSQL server with pgvector can support checks against a
+separate disposable test database, but it does not satisfy `ci:local`'s four
+Postgres 16 shards and transaction-mode PgBouncer coverage. Never point an E2E
+`DATABASE_URL` at an operational database: `setupDB()` clears rows, and some
+tests create and drop databases. Report native-Postgres checks by their actual
+command and isolation; when Docker is unavailable, report the Docker gate as
+unverified.
+
 ## Authorization regression gates
 
 `test/data-frontmatter.test.ts` and `test/frontmatter-security.test.ts` pin inert
