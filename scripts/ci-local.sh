@@ -42,6 +42,27 @@ for arg in "$@"; do
   esac
 done
 
+# Pin one explicit Git baseline for the host scan and every diff selector,
+# including selectors run inside the bind-mounted Docker checkout.
+BASE_REF="${GBRAIN_CI_BASE_REF:-origin/master}"
+if ! BASE_TRACKING_REF=$(git rev-parse --symbolic-full-name --verify --end-of-options "$BASE_REF" 2>/dev/null); then
+  echo "[ci-local] ERROR: baseline '$BASE_REF' is not a Git ref. Set GBRAIN_CI_BASE_REF to the intended remote ref." >&2
+  exit 1
+fi
+case "$BASE_TRACKING_REF" in
+  refs/remotes/*) ;;
+  *)
+    echo "[ci-local] ERROR: baseline '$BASE_REF' is not a remote-tracking ref." >&2
+    exit 1
+    ;;
+esac
+if ! BASE_COMMIT=$(git rev-parse --verify --end-of-options "${BASE_TRACKING_REF}^{commit}" 2>/dev/null); then
+  echo "[ci-local] ERROR: baseline '$BASE_REF' does not resolve to a Git commit." >&2
+  exit 1
+fi
+export GBRAIN_CI_BASE_REF="$BASE_COMMIT"
+echo "[ci-local] Git baseline: $BASE_REF -> $BASE_COMMIT"
+
 cleanup() {
   echo ""
   echo "[ci-local] Tearing down postgres..."
@@ -69,7 +90,7 @@ if [ "$DIFF" = "1" ]; then
       else
         bash scripts/test-gitleaks-config.sh
         bash scripts/scan-worktree-secrets.sh
-        gitleaks git . --redact --no-banner --log-opts="origin/master..HEAD"
+        gitleaks git . --redact --no-banner --log-opts="$GBRAIN_CI_BASE_REF..HEAD"
       fi
       echo "[ci-local] Doc-only fast-path complete. No code paths exercised."
       trap - EXIT
@@ -121,11 +142,11 @@ if ! command -v gitleaks >/dev/null 2>&1; then
 fi
 # Two scopes for pre-push:
 #   1. Working-tree files (catch uncommitted secrets sitting in files)
-#   2. Branch commits vs origin/master (catch secrets committed on this branch)
+#   2. Branch commits vs the pinned baseline (catch secrets committed on this branch)
 # Full-history scan is ~4 min on this repo's 3700+ commits; not useful pre-push.
 bash scripts/test-gitleaks-config.sh
 bash scripts/scan-worktree-secrets.sh
-gitleaks git . --redact --no-banner --log-opts="origin/master..HEAD"
+gitleaks git . --redact --no-banner --log-opts="$GBRAIN_CI_BASE_REF..HEAD"
 
 # Step 1: pull. Refreshes pgvector + the pinned oven/bun tag (both are `image:` not `build:`).
 if [ "$NO_PULL" = "0" ]; then
@@ -386,7 +407,7 @@ fi
 
 echo "[ci-local] Running checks inside runner container..."
 # Bash 3.2 treats an empty array as unset under nounset; preserve zero argv.
-docker compose -f "$COMPOSE_FILE" run --rm ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"} runner bash -c "$INNER_CMD"
+docker compose -f "$COMPOSE_FILE" run --rm -e GBRAIN_CI_BASE_REF="$GBRAIN_CI_BASE_REF" ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"} runner bash -c "$INNER_CMD"
 
 echo ""
 echo "[ci-local] All checks passed."

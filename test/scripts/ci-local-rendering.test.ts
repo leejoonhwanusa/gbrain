@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 
 const source = readFileSync(join(import.meta.dir, '../../scripts/ci-local.sh'), 'utf8');
@@ -57,10 +57,11 @@ describe('ci-local command rendering', () => {
           source.slice(templateStart, templateEnd),
           'bash -c "$INNER_CMD"',
         ].join('\n');
-        const result = spawnSync('bash', ['-c', script], {
+        const result = spawnSync('bash', ['-s'], {
+          input: script,
           cwd: home, encoding: 'utf8', timeout: 5_000,
           env: {
-            ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`,
+            ...process.env, HOME: home, PATH: `${bin}${delimiter}${process.env.PATH}`,
             RUN_PHASES_CMD: phases, PHASE_LOG: phaseLog, PHASE_EXIT: String(phaseExit),
             FIXTURE_MISSING_TOOL: missingTool, INSTALL_LOG: installLog,
           },
@@ -129,10 +130,11 @@ printf 'e2e:%s:%s\\n' "\${SHARD-all}" "$*" >> "$TRACE"
     const script = source.slice(start, templateEnd)
       .replaceAll('/tmp/shard-logs', join(home, 'shard-logs'))
       .replaceAll('/tmp/e2e-selected.txt', join(home, 'selected.txt'));
-    const result = spawnSync('bash', ['-c', `${script}\nbash -c "$INNER_CMD"`], {
+    const result = spawnSync('bash', ['-s'], {
+      input: `${script}\nbash -c "$INNER_CMD"`,
       cwd: home, encoding: 'utf8', timeout: 5_000,
       env: {
-        ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, TRACE: trace,
+        ...process.env, HOME: home, PATH: `${bin}${delimiter}${process.env.PATH}`, TRACE: trace,
         NO_SHARD: noShard ? '1' : '0', DIFF: diff ? '1' : '0', FAIL_STAGE: failStage,
         DATABASE_URL: 'ambient-fixture', GBRAIN_DATABASE_URL: 'ambient-fixture',
         GBRAIN_TEST_DB: 'ambient-must-be-overridden',
@@ -203,7 +205,8 @@ describe('ci-local execution coverage', () => {
         mkdirSync(join(home, 'scripts'));
         writeFileSync(join(bin, 'bun'), '#!/bin/sh\necho DOC_ONLY\n', { mode: 0o755 });
         writeFileSync(join(bin, 'docker'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-        writeFileSync(join(bin, 'gitleaks'), '#!/bin/sh\nprintf "%s\\n" "$1" >> "$SCAN_LOG"\n[ "$SCAN_MODE" != failure ]\n', { mode: 0o755 });
+        writeFileSync(join(bin, 'git'), '#!/bin/sh\ncase "$*" in *--symbolic-full-name*) echo refs/remotes/origin/master ;; *) echo 0123456789012345678901234567890123456789 ;; esac\n', { mode: 0o755 });
+        writeFileSync(join(bin, 'gitleaks'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$SCAN_LOG"\n[ "$SCAN_MODE" != failure ]\n', { mode: 0o755 });
         const end = source.indexOf('# Pre-flight: postgres host ports');
         const script = `command() { if [ "$1" = -v ] && [ "\${2:-}" = gitleaks ] && [ "$SCAN_MODE" = missing ]; then return 1; fi; builtin command "$@"; }\n${source.slice(0, end)}`;
         const log = join(home, 'scans');
@@ -213,11 +216,14 @@ describe('ci-local execution coverage', () => {
         writeFileSync(join(home, 'scripts/scan-worktree-secrets.sh'), 'gitleaks dir . --redact --no-banner\n');
         const result = spawnSync('bash', ['-c', script, join(home, 'scripts/ci-local.sh'), '--diff'], {
           encoding: 'utf8', timeout: 5_000,
-          env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SCAN_MODE: gitleaks, SCAN_LOG: log },
+          env: { ...process.env, GBRAIN_CI_BASE_REF: 'origin/master', PATH: `${bin}${delimiter}${process.env.PATH}`, SCAN_MODE: gitleaks, SCAN_LOG: log },
         });
         expect(result.status, result.stderr).toBe(gitleaks === 'success' ? 0 : 1);
+        expect(result.stdout).toContain('Git baseline: origin/master -> 0123456789012345678901234567890123456789');
         const scans = existsSync(log) ? readFileSync(log, 'utf8') : '';
-        expect(scans).toBe(gitleaks === 'success' ? 'dir\ngit\n' : gitleaks === 'failure' ? 'dir\n' : '');
+        expect(scans).toBe(gitleaks === 'success'
+          ? 'dir . --redact --no-banner\ngit . --redact --no-banner --log-opts=0123456789012345678901234567890123456789..HEAD\n'
+          : gitleaks === 'failure' ? 'dir . --redact --no-banner\n' : '');
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
@@ -282,7 +288,7 @@ exit "$FAKE_EXIT"
         const result = spawnSync('bash', [join(home, 'scripts/run-e2e.sh'), 'test/e2e/pgbouncer-teardown.test.ts'], {
           cwd: home, encoding: 'utf8', timeout: 5_000,
           env: {
-            ...inheritedEnv, HOME: home, PATH: `${bin}:${process.env.PATH}`,
+            ...inheritedEnv, HOME: home, PATH: `${bin}${delimiter}${process.env.PATH}`,
             // This child intentionally exercises one selected file. The outer
             // unit shard must not repartition it into an empty E2E selection.
             SHARD: '',
@@ -338,7 +344,7 @@ test('configuration file respects the parent isolation policy', () => {
 });
 `);
         const env: Record<string, string | undefined> = {
-          ...process.env, HOME: fixture, PATH: `${dirname(process.execPath)}:${process.env.PATH}`,
+          ...process.env, HOME: fixture, PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH}`,
           SHARD: '', COVERAGE_DIR: '', DATABASE_URL: '', GBRAIN_DATABASE_URL: '',
           GBRAIN_CI_REQUIRE_PGBOUNCER: '0', GBRAIN_SOURCE: 'ambient-must-be-removed',
           GBRAIN_CI_DISABLE_TEST_ENV_FILE: disabled,

@@ -141,7 +141,12 @@ mkdir -p "$E2E_TMP_HOME/.gbrain"
 # test). GROK_ also drops an operator's GROK_BIN/GROK_HOME; OPENCODE_ drops
 # OPENCODE_BIN and the OPENCODE_CONFIG* trio. Adapts GStack's
 # buildHermeticEnv() allowlist to gbrain's shell E2E runner.
-for _e2e_var in $(env | grep -oE '^(CONDUCTOR_|MCP_|OPENCLAW_|HERMES_|GROK_|OPENCODE_|GBRAIN_)[A-Za-z0-9_]*' | sort -u); do
+# Enumerate exported names in Bash so Windows sort.exe cannot break the scrub.
+for _e2e_var in $(compgen -e); do
+  case "$_e2e_var" in
+    CONDUCTOR_*|MCP_*|OPENCLAW_*|HERMES_*|GROK_*|OPENCODE_*|GBRAIN_*) ;;
+    *) continue ;;
+  esac
   case "$_e2e_var" in
     GBRAIN_HOME) ;;  # required for HOME isolation (set above) — keep
     GBRAIN_PGLITE_SNAPSHOT|GBRAIN_NO_SNAPSHOT) ;;  # snapshot fast-path fixture (exported by ci-local.sh / runners) — keep
@@ -205,8 +210,17 @@ if [ "${#files[@]}" -eq 0 ]; then
   exit 0
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "ERROR: python3 is required to validate native E2E JUnit reports." >&2
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON_COMMAND=python3
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_COMMAND=python
+else
+  echo "ERROR: Python 3 (python3 or python) is required to validate native E2E JUnit reports." >&2
+  exit 1
+fi
+
+if ! "$PYTHON_COMMAND" -c 'import sys, xml.etree.ElementTree; raise SystemExit(sys.version_info.major != 3)' >/dev/null 2>&1; then
+  echo "ERROR: $PYTHON_COMMAND must be Python 3 with xml.etree.ElementTree to validate native E2E JUnit reports." >&2
   exit 1
 fi
 
@@ -242,7 +256,7 @@ total_fail=0
 file_idx=0
 
 completed_e2e_passes() {
-  python3 - "${1#./}" "$E2E_TMP_HOME/current.junit.xml" "$E2E_TMP_HOME/current.log" <<'PY'
+  "$PYTHON_COMMAND" - "${1#./}" "$E2E_TMP_HOME/current.junit.xml" "$E2E_TMP_HOME/current.log" <<'PY'
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -251,7 +265,14 @@ expected, report, log = sys.argv[1:]
 try:
     root = ET.parse(report).getroot()
     suites = root.findall('testsuite')
-    if root.tag != 'testsuites' or len(suites) != 1 or suites[0].get('file') != expected:
+    if root.tag != 'testsuites' or len(suites) != 1:
+        raise ValueError('wrong selected-file suite')
+    report_file = suites[0].get('file')
+    if sys.platform == 'win32':
+        expected = expected.replace('\\', '/')
+        if report_file is not None:
+            report_file = report_file.replace('\\', '/')
+    if report_file != expected:
         raise ValueError('wrong selected-file suite')
     for node in [root, *root.iter('testsuite')]:
         cases = list(node.iter('testcase'))
@@ -271,7 +292,8 @@ try:
     with open(log) as stream:
         for raw in stream:
             line = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\n'))
-            header = header or line in (expected + ':', '::group::' + expected + ':')
+            header_line = line.replace('\\', '/') if sys.platform == 'win32' else line
+            header = header or header_line in (expected + ':', '::group::' + expected + ':')
             count = re.fullmatch(r'\s*(\d+) (pass|fail|skip|todo)\s*', line)
             if count:
                 value, kind = count.groups()
@@ -349,6 +371,12 @@ for f in "${files[@]}"; do
   esac
   if command -v gtimeout >/dev/null 2>&1; then
     TIMEOUT_CMD="gtimeout $file_timeout"
+  elif [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+    if [ ! -x /usr/bin/timeout ]; then
+      echo "ERROR: Git Bash/Cygwin GNU timeout is required for the E2E time limit." >&2
+      exit 1
+    fi
+    TIMEOUT_CMD="/usr/bin/timeout $file_timeout"
   elif command -v timeout >/dev/null 2>&1; then
     TIMEOUT_CMD="timeout $file_timeout"
   else

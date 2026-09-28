@@ -2,7 +2,7 @@
 // scripts/select-e2e.ts
 //
 // Fail-closed diff-based E2E test selector. Reads the working-tree diff vs
-// origin/master plus untracked files, classifies the change set as
+// the configured Git baseline (origin/master by default) plus untracked files, classifies the change set as
 // EMPTY / DOC_ONLY / SRC, and emits one relevant E2E test path per stdout line.
 //
 // CONTRACT (fail-closed):
@@ -13,7 +13,7 @@
 //
 // Selection algorithm:
 //   1. Read changed files from three git sources, union them:
-//        - git diff --name-only origin/master...HEAD   (committed)
+//        - git diff --name-only BASE...HEAD   (committed)
 //        - git diff --name-only HEAD                   (unstaged + staged)
 //        - git ls-files --others --exclude-standard    (untracked, NOT .gitignore'd)
 //   2. EMPTY  -> emit ALL test/e2e/*.test.ts
@@ -206,8 +206,9 @@ function runGit(args: string[], cwd: string): string {
 }
 
 function readChangedFiles(repoRoot: string): string[] {
+  const baseRef = process.env.GBRAIN_CI_BASE_REF || "origin/master";
   const sources = [
-    runGit(["diff", "--name-only", "origin/master...HEAD"], repoRoot),
+    runGit(["diff", "--name-only", `${baseRef}...HEAD`], repoRoot),
     runGit(["diff", "--name-only", "HEAD"], repoRoot),
     runGit(["ls-files", "--others", "--exclude-standard"], repoRoot),
   ];
