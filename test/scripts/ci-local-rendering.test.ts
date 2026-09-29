@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
@@ -230,6 +230,105 @@ describe('ci-local execution coverage', () => {
     });
   }
 });
+
+test.skipIf(process.platform !== 'linux')('Windows-source staging runs from current bytes with isolated Git metadata and preserves failure diagnostics', () => {
+  expect(templateStart).toBeGreaterThanOrEqual(0);
+  expect(templateEnd).toBeGreaterThan(templateStart);
+  const home = mkdtempSync(join(tmpdir(), 'gbrain-ci-source-stage-'));
+  const repo = join(home, 'repo');
+  const tmp = join(home, 'tmp');
+  const bin = join(home, 'bin');
+  mkdirSync(repo);
+  mkdirSync(tmp);
+  mkdirSync(bin);
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
+    return result.stdout;
+  };
+  try {
+    git('init', '-q', '--initial-branch=main');
+    git('config', 'user.name', 'CI staging fixture');
+    git('config', 'user.email', 'ci-staging@example.invalid');
+    writeFileSync(join(repo, '.gitignore'), '.context/\n');
+    writeFileSync(join(repo, 'tracked.txt'), 'baseline tracked bytes\n');
+    writeFileSync(join(repo, 'deleted.txt'), 'baseline deleted bytes\n');
+    writeFileSync(join(repo, 'baseline.txt'), 'pinned source baseline\n');
+    git('add', '.');
+    git('commit', '-qm', 'source staging baseline');
+
+    writeFileSync(join(repo, 'tracked.txt'), 'dirty tracked bytes\n');
+    rmSync(join(repo, 'deleted.txt'));
+    writeFileSync(join(repo, 'untracked.txt'), 'eligible untracked bytes\n');
+    mkdirSync(join(repo, '.qa'));
+    writeFileSync(join(repo, '.qa', 'private-canary.txt'), 'must not be staged\n');
+    writeFileSync(join(repo, '.env'), 'PRIVATE_STAGE_CANARY=do-not-copy\n');
+    const statusBefore = git('status', '--porcelain=v1', '-z');
+    const headBefore = git('rev-parse', 'HEAD');
+    const indexBefore = readFileSync(join(repo, '.git', 'index'));
+    const phaseLog = join(repo, '.context', 'ci-local-staging-phase.log');
+    const stageRootLog = join(repo, '.context', 'ci-local-staging-root.txt');
+    for (const name of ['ps', 'psql', 'jq', 'apt-get']) {
+      writeFileSync(join(bin, name), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    }
+    writeFileSync(join(bin, 'bun'), '#!/bin/sh\n[ "$1" != --version ] || { echo 1.3.13; exit 0; }\nexit 0\n', { mode: 0o755 });
+
+    const phase = [
+      'printf "%s\\n" "$PWD" > "$STAGED_ROOT_LOG"',
+      'printf "%s\\n" "staging failure diagnostics retained" > .context/ci-local-staging-phase.log',
+      'exit 23',
+    ].join('\n');
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: home,
+      TMPDIR: tmp,
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ''}`,
+      GBRAIN_CI_WINDOWS_SOURCE: '1',
+      GBRAIN_CI_DIFF: '0',
+      GBRAIN_CI_BASE_REF: headBefore.trim(),
+      RUN_PHASES_CMD: phase,
+      STAGED_ROOT_LOG: stageRootLog,
+      DATABASE_URL: undefined,
+      GBRAIN_DATABASE_URL: undefined,
+      GBRAIN_TEST_ALLOW_DATABASE_URL: undefined,
+    };
+    const result = spawnSync('bash', ['-s'], {
+      input: `${source.slice(templateStart, templateEnd)}\nbash -c "$INNER_CMD"`,
+      cwd: repo,
+      encoding: 'utf8',
+      timeout: 20_000,
+      env,
+    });
+
+    expect(result.status, result.stdout + result.stderr).toBe(23);
+    expect(existsSync(phaseLog)).toBe(true);
+    expect(readFileSync(phaseLog, 'utf8')).toBe('staging failure diagnostics retained\n');
+    expect(readFileSync(join(repo, 'tracked.txt'), 'utf8')).toBe('dirty tracked bytes\n');
+    expect(existsSync(join(repo, 'deleted.txt'))).toBe(false);
+    expect(readFileSync(join(repo, 'untracked.txt'), 'utf8')).toBe('eligible untracked bytes\n');
+    expect(readFileSync(join(repo, '.qa', 'private-canary.txt'), 'utf8')).toBe('must not be staged\n');
+    expect(readFileSync(join(repo, '.env'), 'utf8')).toBe('PRIVATE_STAGE_CANARY=do-not-copy\n');
+    expect(readFileSync(join(repo, '.git', 'index'))).toEqual(indexBefore);
+    expect(git('rev-parse', 'HEAD')).toBe(headBefore);
+    expect(git('status', '--porcelain=v1', '-z')).toBe(statusBefore);
+
+    const stagedRoot = readFileSync(stageRootLog, 'utf8').trim();
+    expect(stagedRoot).not.toBe(repo);
+    expect(resolve(dirname(stagedRoot))).toBe(resolve(tmp));
+    expect(lstatSync(join(stagedRoot, '.git')).isSymbolicLink()).toBe(false);
+    expect(existsSync(join(stagedRoot, '.git', 'index'))).toBe(true);
+    expect(readFileSync(join(stagedRoot, '.git', 'index'))).toEqual(indexBefore);
+    expect(readFileSync(join(stagedRoot, 'tracked.txt'), 'utf8')).toBe('dirty tracked bytes\n');
+    expect(existsSync(join(stagedRoot, 'deleted.txt'))).toBe(false);
+    expect(readFileSync(join(stagedRoot, 'untracked.txt'), 'utf8')).toBe('eligible untracked bytes\n');
+    expect(existsSync(join(stagedRoot, '.qa'))).toBe(false);
+    expect(existsSync(join(stagedRoot, '.env'))).toBe(false);
+    const baseline = spawnSync('git', ['-C', stagedRoot, 'cat-file', '-e', `${headBefore.trim()}^{commit}`], { encoding: 'utf8' });
+    expect(baseline.status, baseline.stderr).toBe(0);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 25_000);
 
 describe('required PgBouncer execution through run-e2e', () => {
   for (const [required, passes, testExit, expectedExit, parentCoverageExists, outputBytes = 0] of [

@@ -27,6 +27,18 @@
 # Markdown it does not own), but pinning this repo's own .md checkout to LF
 # removes the whole class for anyone working here.
 *.md text eol=lf
+skills/** text=auto eol=lf
+plugin/** text=auto eol=lf
+plugin-variants/** text=auto eol=lf
+templates/bootstrap/** text=auto eol=lf
+scripts/*.tsv text=auto eol=lf
+scripts/*.allowlist text=auto eol=lf
+.github/workflows/*.yml text=auto eol=lf
+.github/workflows/*.yaml text=auto eol=lf
+/.agents/gbrain-launcher text=auto eol=lf
+/.codex-plugin/mcp.json text=auto eol=lf
+# Bun-linked CLI launchers must retain the same shebang and source bytes.
+/src/cli.ts text=auto eol=lf
 /.gbrain-evals/eval-results.jsonl merge=union
 
 # Native source hashes and prebuilds must survive Windows checkout unchanged.

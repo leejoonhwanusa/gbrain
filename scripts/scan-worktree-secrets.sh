@@ -4,7 +4,21 @@
 # even if a later .gitignore rule would otherwise hide them.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-python3 - <<'PY'
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON_COMMAND=python3
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_COMMAND=python
+else
+  echo "ERROR: Python 3 (python3 or python) is required for the worktree secret scan." >&2
+  exit 1
+fi
+
+if ! "$PYTHON_COMMAND" -c 'import sys; raise SystemExit(sys.version_info.major != 3)' >/dev/null 2>&1; then
+  echo "ERROR: $PYTHON_COMMAND must be Python 3 for the worktree secret scan." >&2
+  exit 1
+fi
+
+"$PYTHON_COMMAND" - <<'PY'
 import os, pathlib, shutil, subprocess, tempfile
 root = pathlib.Path.cwd()
 paths = subprocess.check_output(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard']).split(b'\0')

@@ -75,6 +75,12 @@ required; running a judged benchmark still needs its configured providers.
 
 ### Fixed
 
+- Run Windows Docker CI from a checked copy of the current source on Linux
+  storage, preserving dirty inputs, the Git baseline, isolated dependencies,
+  failure logs and existing test deadlines. Host security helpers also use the
+  pinned uv Python environment when only `python` is available.
+- Preserve canonical LF inputs for byte-sensitive CI checks and keep the
+  minion supervisor within the module-size limit by reusing its spawn helper.
 - Retain all provider text blocks and any incomplete partial text separately
   from a completed hypothesis. Output-limit, empty and unknown completions are
   recorded as failed reader rows, kept in the judged denominator, and fail the

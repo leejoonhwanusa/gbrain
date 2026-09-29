@@ -131,6 +131,13 @@ services:
       # The bind-mounted checkout may contain private developer test keys.
       # This gate uses isolated DBs and synthetic provider fixtures, like CI.
       GBRAIN_CI_DISABLE_TEST_ENV_FILE: "1"
+      # Bound concurrent compiler/whole-tree scans on host bind mounts.
+      GBRAIN_VERIFY_MAX_PARALLEL: "${GBRAIN_VERIFY_MAX_PARALLEL:-4}"
+      # Default remains 120s; process-only overrides can cover the measured
+      # cold Windows Docker typecheck without changing the check set.
+      GBRAIN_VERIFY_TIMEOUT: "${GBRAIN_VERIFY_TIMEOUT:-120}"
+      # Empty preserves the serial runner's CPU/memory-based pool selection.
+      GBRAIN_SERIAL_POOL: "${GBRAIN_SERIAL_POOL:-}"
     # #3893 (reimplemented from @y2688): give a TERM'd runner up to 600s to
     # drain in-flight bun test shards and flush their results before docker
     # SIGKILLs the container mid-write (compose default grace is 10s).

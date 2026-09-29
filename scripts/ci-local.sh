@@ -221,7 +221,7 @@ env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun run test:slow
 echo "[runner] unit (unsharded, DATABASE_URL unset)"
 env -u DATABASE_URL bash scripts/run-unit-shard.sh
 echo "[runner] e2e (unsharded, --diff selected)"
-SELECTED=$(bun run scripts/select-e2e.ts)
+SELECTED=$(if [ "${CI_STAGED_SOURCE:-0}" = "1" ]; then cat /tmp/e2e-selected.txt; else bun run scripts/select-e2e.ts; fi)
 if [ -z "$SELECTED" ]; then
   echo "[runner] selector emitted nothing (doc-only diff); skipping E2E."
 else
@@ -255,7 +255,7 @@ else
   # Tier 1 sharded path. Each shard runs unit+E2E sequentially against its
   # own postgres-N. Shards run in parallel via xargs -P4.
   if [ "$DIFF" = "1" ]; then
-    DIFF_E2E_PREP='SELECTED=$(bun run scripts/select-e2e.ts)
+    DIFF_E2E_PREP='SELECTED=$(if [ "${CI_STAGED_SOURCE:-0}" = "1" ]; then cat /tmp/e2e-selected.txt; else bun run scripts/select-e2e.ts; fi)
 if [ -z "$SELECTED" ]; then
   echo "" > /tmp/e2e-selected.txt
 else
@@ -372,6 +372,114 @@ fi
 # Container runs as root (uid 0) against a host-uid bind-mount; mark repo +
 # any worktree gitdir as safe so `git status` etc. don't refuse.
 git config --global --add safe.directory '*' || true
+# Windows bind mounts make repeated CLI/module reads exceed existing test
+# budgets. Keep inputs in Linux storage while retaining the original checkout
+# for diff selection and the existing named volumes and diagnostic outputs.
+CI_STAGED_SOURCE=0
+if [ "${GBRAIN_CI_WINDOWS_SOURCE:-0}" = "1" ]; then
+  CI_EXEC_ROOT=$(python3 - <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+source = Path.cwd()
+
+def git(root, *args):
+    return subprocess.check_output(["git", "-C", str(root), *args])
+
+gitdir = source / ".git"
+if not gitdir.is_dir() or gitdir.is_symlink():
+    raise SystemExit("[runner] Windows source staging requires a standalone checkout; linked worktrees are not supported.")
+if (gitdir / "index.lock").exists() or (gitdir / "objects/info/alternates").exists():
+    raise SystemExit("[runner] Cannot stage a locked index or external Git object store.")
+head = git(source, "rev-parse", "HEAD")
+index = (gitdir / "index").read_bytes()
+protected = {".gbrain", ".qa", ".context", ".venv", ".git"}
+volumes = ("node_modules", "admin/node_modules", "admin/dist")
+snapshots = ("test/fixtures/pglite-snapshot.tar", "test/fixtures/pglite-snapshot.version",
+             "test/fixtures/pglite-snapshot-default.tar", "test/fixtures/pglite-snapshot-default.version")
+
+def inputs():
+    tracked = set(git(source, "ls-files", "--cached", "-z").split(b"\0")) - {b""}
+    others = set(git(source, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")) - {b""}
+    result = []
+    for raw in sorted(tracked | others | {os.fsencode(p) for p in snapshots}):
+        name = os.fsdecode(raw)
+        path = Path(name)
+        if path.is_absolute() or ".." in path.parts:
+            raise SystemExit("[runner] Unsafe source input path.")
+        if any(name == v or name.startswith(v + "/") for v in volumes):
+            continue
+        private = path.parts[0] in protected or any(
+            p == ".env" or (p.startswith(".env.") and not p.endswith(".example"))
+            for p in path.parts)
+        if private:
+            if raw in tracked:
+                raise SystemExit("[runner] Tracked source conflicts with protected path: " + name)
+            continue
+        origin = source / path
+        if origin.is_symlink() or not origin.resolve().is_relative_to(source):
+            raise SystemExit("[runner] Source symlinks are not supported: " + name)
+        if not origin.exists():
+            continue  # A tracked working-tree deletion remains deleted.
+        if not origin.is_file():
+            raise SystemExit("[runner] Source input is not a regular file: " + name)
+        result.append(name)
+    return result
+
+def digest(root, paths):
+    result = hashlib.sha256()
+    for name in paths:
+        result.update(os.fsencode(name) + b"\0")
+        result.update(hashlib.sha256((root / name).read_bytes()).digest())
+    return result.hexdigest()
+
+paths = inputs()
+before = digest(source, paths)
+# Resolve --diff against the original checkout, including protected untracked
+# paths, inside the same source-stability interval as the copy.
+if os.environ.get("GBRAIN_CI_DIFF") == "1":
+    selected = subprocess.check_output(["bun", "run", "scripts/select-e2e.ts"], cwd=source)
+    Path("/tmp/e2e-selected.txt").write_bytes(selected)
+target = Path(tempfile.mkdtemp(prefix="gbrain-ci-source-"))
+for name in paths:
+    destination = target / name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / name, destination)
+# Independent metadata prevents Bun/Git fixtures from refreshing the host index.
+for directory, dirs, files in os.walk(gitdir):
+    if any((Path(directory) / name).is_symlink() for name in dirs + files):
+        raise SystemExit("[runner] Linked Git metadata is not supported.")
+shutil.copytree(gitdir, target / ".git", symlinks=False)
+git(target, "config", "core.bare", "false")
+unset = subprocess.run(["git", "-C", str(target), "config", "--unset-all", "core.worktree"])
+if unset.returncode not in (0, 5):
+    raise SystemExit("[runner] Failed to isolate the copied Git working directory.")
+if Path(os.fsdecode(git(target, "rev-parse", "--show-toplevel")).strip()).resolve() != target.resolve():
+    raise SystemExit("[runner] Copied Git metadata resolves outside the execution directory.")
+git(target, "cat-file", "-e", os.environ["GBRAIN_CI_BASE_REF"] + "^{commit}")
+if (inputs() != paths or digest(source, paths) != before or digest(target, paths) != before
+        or git(source, "rev-parse", "HEAD") != head or git(target, "rev-parse", "HEAD") != head
+        or (gitdir / "index").read_bytes() != index or (target / ".git/index").read_bytes() != index
+        or (gitdir / "index.lock").exists()):
+    raise SystemExit("[runner] Source changed while preparing the Linux execution directory.")
+for name in (*volumes, ".context"):
+    (source / name).mkdir(parents=True, exist_ok=True)
+    (target / name).parent.mkdir(parents=True, exist_ok=True)
+    (target / name).symlink_to(source / name, target_is_directory=True)
+print(f"[runner] Linux source inputs: {len(paths)} files, sha256={before}", file=sys.stderr)
+print(target)
+PY
+  )
+  cd "$CI_EXEC_ROOT"
+  CI_STAGED_SOURCE=1
+fi
+# Internal runner controls must not leak into nested CI rendering fixtures.
+unset GBRAIN_CI_WINDOWS_SOURCE GBRAIN_CI_DIFF
 # Revalidate even a warm dependency volume against this checkout's lockfile.
 echo "[runner] bun install --frozen-lockfile"
 bun install --frozen-lockfile
@@ -406,8 +514,10 @@ if [ -f .git ]; then
 fi
 
 echo "[ci-local] Running checks inside runner container..."
+WINDOWS_SOURCE=0
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WINDOWS_SOURCE=1 ;; esac
 # Bash 3.2 treats an empty array as unset under nounset; preserve zero argv.
-docker compose -f "$COMPOSE_FILE" run --rm -e GBRAIN_CI_BASE_REF="$GBRAIN_CI_BASE_REF" ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"} runner bash -c "$INNER_CMD"
+docker compose -f "$COMPOSE_FILE" run --rm -e GBRAIN_CI_BASE_REF="$GBRAIN_CI_BASE_REF" -e GBRAIN_CI_WINDOWS_SOURCE="$WINDOWS_SOURCE" -e GBRAIN_CI_DIFF="$DIFF" ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"} runner bash -c "$INNER_CMD"
 
 echo ""
 echo "[ci-local] All checks passed."

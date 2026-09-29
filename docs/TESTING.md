@@ -670,10 +670,11 @@ before those pins need a one-time `git rm --cached -r . -q && git reset --hard` 
 pick them up; see the Windows section of `CONTRIBUTING.md`.
 
 Wallclock figures in the table above are from a Mac dev box. Windows is
-substantially slower because each check pays full process-creation cost, and three
-tree-walking checks (`check:privacy`, `check:test-names`, `check:test-isolation`)
-plus `typecheck` can exceed the 120s per-check cap in `run-verify-parallel.sh`
-there even though they pass on Linux and macOS.
+substantially slower, and three tree-walking checks (`check:privacy`,
+`check:test-names`, `check:test-isolation`) plus `typecheck` can exceed the
+default 120s per-check timeout in `run-verify-parallel.sh` there even though
+they pass on Linux and macOS. The measured cold Windows Docker full typecheck
+took about 275s, with about 213s in TypeScript's `Check` phase.
 
 ### CI vs local: intentionally divergent file sets
 
@@ -1363,6 +1364,42 @@ environment's Python is available to the Bash runner. Bun remains the test
 runtime; for example, with a safe test database configured, run
 `uv run --offline --no-python-downloads bun run test:e2e`.
 
+The host security checks (`scripts/test-gitleaks-config.sh` and
+`scripts/scan-worktree-secrets.sh`) also require Python 3 and select `python3`,
+or `python` only when `python3` is absent. Run `ci:local` through the same uv
+environment. On Windows, prepend Git's `usr\bin` directory (for example,
+`C:\Program Files\Git\usr\bin`) to the command's process-only `PATH` so the
+actual Bash executable precedes the WSL `bash.exe` launcher. Avoid Git's
+`bin\bash.exe` wrapper for these tests: it can prepend Git directories ahead
+of fixture command stubs and accidentally invoke the host Git. This does not
+require a system PATH change. Docker's Linux runner retains its pinned Bun version.
+
+Docker CI also forwards `GBRAIN_SERIAL_POOL`; unset preserves the serial runner's
+CPU/memory-based pool selection. On Windows Docker, set the process environment
+variable `GBRAIN_SERIAL_POOL=1` when pooled CLI/PGLite startup exceeds existing
+deadlines. This runs the complete serial selection sequentially and takes longer;
+the 300-second file cap, 120-second test timeout, and readiness checks stay unchanged.
+In the observed checkout, two files failed with pool four but passed alone at the
+same limits: backup/recovery (14 tests, 244.77 seconds) and admin startup (5 tests,
+23.25 seconds). This identifies a contention effect, not the specific resource
+bottleneck; the full CI gate must still pass with the selected setting.
+
+Docker CI forwards `GBRAIN_VERIFY_MAX_PARALLEL` (default four) and the existing
+`GBRAIN_VERIFY_TIMEOUT` option (default 120 seconds) to the verify dispatcher.
+For the measured cold Windows Docker typecheck, set `GBRAIN_VERIFY_TIMEOUT=300`
+in the invoking process environment. The override changes only the per-check
+deadline; the check set and failure propagation stay unchanged. Override the
+worker count in the invoking process when needed; it does not change the four
+database test shards.
+
+Shell scripts, Markdown and byte-sensitive CI inputs must use the repository's
+LF checkout attributes. This includes skill manifests and inputs, generated
+plugin/template trees, TSV inventories, isolation allowlists and workflow pins.
+If an older Windows checkout predates these attributes, compare tracked files
+with their index blobs before restoring canonical LF bytes. Preserve uncommitted
+work and intentional binary/fixture bytes; do not regenerate manifests to match
+CRLF-converted inputs.
+
 Windows host runs use Git Bash's `/usr/bin/timeout` for the existing per-file
 time limit; Windows `timeout.exe` is not compatible. The runner enumerates
 exported variables with Bash's `compgen` to preserve environment isolation
@@ -1421,6 +1458,24 @@ A per-user Docker Desktop installation does not by itself make this E2E gate
 available. Verify that `docker info` reaches a Linux engine; first-time Windows
 virtualization feature setup can require elevation and a restart even though the
 per-user installer does not. See [Docker's Windows permission requirements](https://docs.docker.com/desktop/setup/install/windows-permission-requirements/).
+
+On Windows, `ci:local` stages the current checkout bytes into a temporary Linux
+source directory before running the container checks. It carries tracked edits,
+eligible untracked files and tracked deletions, with independent Git metadata
+that must contain the selected baseline commit. Protected `.gbrain`, `.qa`,
+`.context`, `.venv` and private `.env` files stay out of the copy; dependency and
+build volumes plus `.context` diagnostics remain connected to the original
+checkout. Linked Windows worktrees fail closed because their Git metadata lives
+outside the bind mount. Linux and macOS continue using the checkout directly;
+staging does not change the selected checks or their existing deadlines.
+
+In the measured Windows checkout, moving identical source bytes off the bind
+mount reduced the local-install lifecycle body from 200.9 to 128.0 seconds,
+passing its unchanged 180-second limit. Through the staging path, the read
+diagnostics case passed in 56.25 seconds and all four reconcile-owner scenarios
+finished in 184.09 seconds under the existing 300-second file cap. Preparing
+and checking the source copy adds a one-time cost; these focused results do not
+replace the complete CI gate or source-bound review.
 
 An existing PostgreSQL server with pgvector can support checks against a
 separate disposable test database, but it does not satisfy `ci:local`'s four

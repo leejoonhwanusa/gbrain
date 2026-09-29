@@ -14,6 +14,9 @@ for (const populated of [false, true]) {
       'set -eu',
       'COMPOSE_FILE=compose.yml',
       'INNER_CMD="echo test"',
+      'GBRAIN_CI_BASE_REF=0123456789abcdef0123456789abcdef01234567',
+      'WINDOWS_SOURCE=1',
+      'DIFF=0',
       populated ? 'EXTRA_MOUNTS=(-v "/tmp/path with spaces:/git:ro")' : 'EXTRA_MOUNTS=()',
       'docker() { printf "<%s>\\n" "$@"; }',
       line!,
@@ -22,6 +25,8 @@ for (const populated of [false, true]) {
     expect(result.status).toBe(0);
     expect(result.stderr).toBe('');
     const expected = ['compose', '-f', 'compose.yml', 'run', '--rm',
+      '-e', 'GBRAIN_CI_BASE_REF=0123456789abcdef0123456789abcdef01234567',
+      '-e', 'GBRAIN_CI_WINDOWS_SOURCE=1', '-e', 'GBRAIN_CI_DIFF=0',
       ...(populated ? ['-v', '/tmp/path with spaces:/git:ro'] : []),
       'runner', 'bash', '-c', 'echo test'];
     expect(result.stdout).toBe(expected.map(value => `<${value}>\n`).join(''));
