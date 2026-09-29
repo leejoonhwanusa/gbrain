@@ -16,6 +16,7 @@
  */
 
 import { execFileSync } from 'child_process';
+import type { SupervisorOpts } from './supervisor.ts';
 
 /**
  * Resolve the tini binary path, or return an empty string when not on PATH.
@@ -53,4 +54,42 @@ export function buildSpawnInvocation(
   return tiniPath
     ? { cmd: tiniPath, args: ['--', cliPath, ...args] }
     : { cmd: cliPath, args };
+}
+
+/**
+ * Build the argv the supervisor uses to spawn `gbrain jobs work`. Extracted from
+ * runSuperviseLoop so it's unit-testable (issue #1815, Codex). Appends `--nice N`
+ * when the operator requested a niceness, alongside the existing concurrency /
+ * queue / max-rss flags. The spawned worker re-applies the niceness to itself;
+ * niceness also inherits to the worker's own children automatically.
+ */
+export function buildWorkerArgs(
+  opts: Pick<SupervisorOpts, 'concurrency' | 'queue' | 'maxRssMb' | 'nice_requested' | 'jobIsolation'> &
+    Partial<Pick<SupervisorOpts, 'allowShellJobs'>>,
+): string[] {
+  const args = [
+    'jobs', 'work',
+    '--concurrency', String(opts.concurrency),
+    '--queue', opts.queue,
+  ];
+  if (opts.maxRssMb > 0) {
+    args.push('--max-rss', String(opts.maxRssMb));
+  }
+  if (opts.nice_requested !== undefined) {
+    args.push('--nice', String(opts.nice_requested));
+  }
+  // Conditional push (issue #5): omitted for inline so existing deployments'
+  // argv is byte-identical (pinned by supervisor-build-worker-args.test.ts).
+  if (opts.jobIsolation === 'process') {
+    args.push('--job-isolation', 'process');
+  }
+  // Conditional push: the shell opt-in travels as a flag as well as env. The
+  // worker's startup cwd-.env quarantine (core/env-trust.ts) drops
+  // GBRAIN_ALLOW_SHELL_JOBS whenever a .env in the worker's cwd assigns it,
+  // so an env-only handoff could silently disable shell jobs; `jobs work`
+  // re-asserts the env from this flag after its preflight.
+  if (opts.allowShellJobs) {
+    args.push('--allow-shell-jobs');
+  }
+  return args;
 }
