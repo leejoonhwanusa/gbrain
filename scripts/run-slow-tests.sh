@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/run-slow-tests.sh
 # Tier 4 sister to run-unit-shard.sh: runs ONLY *.slow.test.ts files.
-# CI and bun run ci:local both run this lane alongside the unit shards.
+# Each file runs in its own process to isolate module state and PGLite lifetimes.
 
 set -euo pipefail
 
@@ -30,10 +30,16 @@ if [ "${#slow_files[@]}" -eq 0 ]; then
   exit 0
 fi
 
-echo "[run-slow-tests] running ${#slow_files[@]} slow files (CI runs these as part of bun run test)"
-# v0.40.10 flake-hardening: bump per-test timeout 60s → 120s. Slow tests
-# legitimately approach 60s in isolation (longmemeval E2E suite is ~50s);
-# when bun runs slow files in parallel, CPU contention pushes them past
-# 60s and individual tests timeout even though they'd pass solo. Slow
-# tests are explicit by-name — generous per-test budget is correct.
-exec bun test --timeout=120000 "${slow_files[@]}"
+echo "[run-slow-tests] running ${#slow_files[@]} slow files sequentially in separate processes"
+result=0
+for file in "${slow_files[@]}"; do
+  echo "[run-slow-tests] $file"
+  if bun test --timeout=120000 "$file"; then
+    :
+  else
+    result=$?
+    # Preserve signal exits instead of starting another file after interruption.
+    if [ "$result" -ge 128 ]; then exit "$result"; fi
+  fi
+done
+exit "$result"
