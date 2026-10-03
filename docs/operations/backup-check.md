@@ -92,6 +92,26 @@ The restore quarantines unfinished jobs and does not start automation. It
 does not overwrite an existing root. This local archive path is not a hosted
 Postgres backup procedure; arrange and test a separate Postgres backup there.
 
+For **Postgres**, use the existing native `pg_dump` client to create a new
+private custom-format archive. Configure the intended connection and
+credentials outside commands and public documentation (for example, a
+private libpq service/password file); never put credentials in Git. Choose
+an unused archive path outside the source tree. In PowerShell:
+
+```powershell
+$archive = 'C:\private-backups\brain-new.dump'
+pg_dump --format=custom --file $archive
+pg_restore --list $archive
+Get-FileHash -LiteralPath $archive -Algorithm SHA256
+```
+
+Require `pg_dump` and `pg_restore --list` to exit successfully and retain the
+checksum privately. These establish archive creation, table-of-contents
+inspection and a checksum for later comparison. They do not prove a restore
+works, preserve cluster roles, or cover external files and credentials. A
+separate restore drill into an isolated destination must verify the required
+data, roles and external assets before claiming recovery.
+
 Exit codes: 0 ok / 1 warn / 2 usage error. Two forced-0 paths: the global
 `--quiet` flag (the detached-spawn mode) always exits 0, and a disabled check
 (`backup.check_enabled=false` / `GBRAIN_BACKUP_CHECK=0`) exits 0 even on a

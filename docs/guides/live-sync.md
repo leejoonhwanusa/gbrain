@@ -35,7 +35,7 @@ entirely. Verify by running `gbrain sync` and checking that the page count in
 
 ### The Primitives
 
-Always chain sync + embed:
+For repository-backed content, pair sync with stale embedding backfill:
 
 ```bash
 gbrain sync --repo /path/to/brain && gbrain embed --stale
@@ -61,6 +61,49 @@ gbrain sync --repo /path/to/brain && gbrain embed --stale
   (configurable with `--interval N`). Embeds inline for small changesets. Exits
   after 5 consecutive failures, so run under a process manager or pair with a
   cron fallback.
+
+### Read health findings in the source's context
+
+Start with a local inspection that does not apply schema migrations:
+
+```bash
+gbrain doctor --scope=brain --no-migrate --json
+```
+
+Inspect the individual findings and the source's write path, not just the
+aggregate score. Optional graph extraction, paid enrichment and dream-cycle
+phases are not prerequisites for every memory workflow. A partial
+shared-skills finding describes that subsystem; it does not authorize a
+blanket migration, publication, or access-grant change.
+
+A source written directly through memory operations can hold current DB
+pages without a repository sync timestamp. For an isolated, non-federated
+memory source, keep reads and writes scoped to that source; do not enable
+capture or force a sync solely to clear an old timestamp. For a managed
+source, inspect its current projection and run diagnostics before deciding
+that an old legacy sync date means indexing stopped.
+
+When an embedding provider is configured and the finding identifies stale
+chunks, preview the exact source before running its backfill:
+
+```bash
+gbrain embed --stale --source <source-id> --dry-run
+gbrain embed --stale --source <source-id>
+```
+
+The preview is not execution evidence. Inspect the completed backfill and
+the remaining findings; embedding completion does not prove graph freshness
+or whole-brain recovery.
+
+If the default source's root is missing, do not point it at another source's
+already-owned root or bypass the overlap guard. For a classic source whose
+repair is only a pointer change, a separate restored root can be adopted
+with `gbrain sources set-path <source-id> <restored-root>` after reviewing
+every existing page's `source_path`, slug and raw sidecar against that root.
+Ordinary `gbrain export --dir <backup-dir>` writes `<slug>.md`; it does not
+automatically reconstruct the original `source_path` layout. A managed
+source must follow its own lifecycle rather than assuming classic pointer
+repair applies.
 
 ### Approach 1: Cron Job (recommended)
 
@@ -147,10 +190,11 @@ vars — incident-time escape hatches, not everyday knobs.
 
 ## Tricky Spots
 
-1. **Always chain sync + embed.** Running `gbrain sync` without
-   `gbrain embed --stale` leaves new chunks without embeddings. They exist
-   in the database but are invisible to vector search. Always run both
-   commands together. The `&&` ensures embed only runs if sync succeeds.
+1. **Backfill deferred repository embeddings.** Small syncs can embed inline;
+   large syncs or cost-gated imports may leave chunks pending. Pair repository
+   sync with `gbrain embed --stale` when vector retrieval is configured. The
+   `&&` ensures embed only runs if sync succeeds. Keyword-only and directly
+   written DB memory workflows do not require repository sync.
 
 2. **--watch polls, it doesn't stream.** The `--watch` flag polls every 60s
    (configurable). It is not a filesystem watcher or git hook. It exits after

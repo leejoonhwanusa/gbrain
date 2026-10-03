@@ -175,6 +175,31 @@ a conservative payload starves an expensive one. The full methodology and
 realistic-scale walkthrough live in
 [`docs/eval/SEARCH_MODE_METHODOLOGY.md`](../eval/SEARCH_MODE_METHODOLOGY.md).
 
+### Query-only embedding instructions
+
+For an installed CLI that supports `embedding_query_prefix`, a Qwen3 query
+instruction belongs on the query side only. Confirm that the installed
+embedding consumer reads this key before setting it; accepting an arbitrary
+config key alone does not prove it affects retrieval. In PowerShell, use a
+literal LF between the instruction and `Query:`:
+
+```powershell
+$prefix = "Instruct: Given a web search query, retrieve relevant passages that answer the query`nQuery:"
+gbrain config set embedding_query_prefix $prefix
+gbrain config get embedding_query_prefix
+```
+
+The readback must contain exactly these two lines, with an LF between them:
+
+```text
+Instruct: Given a web search query, retrieve relevant passages that answer the query
+Query:
+```
+
+This setting changes query input. It does not change the embedding model or
+dimensions, rewrite document text, or re-embed stored vectors. A different
+model or dimension requires the separate embedding-migration workflow.
+
 ### CLI surfaces
 
 ```bash
