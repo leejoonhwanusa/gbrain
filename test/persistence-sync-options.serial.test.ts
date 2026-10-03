@@ -26,6 +26,7 @@ import { cleanupRetiredManagedMarkers } from '../src/core/persistence/deactivati
 import { PHYSICAL_ROOT_MARKER, physicalRootReservationPath } from '../src/core/persistence/physical-root-record.ts';
 import { managedRootRecordPath, recordManagedRoots, registeredManagedRoots } from '../src/core/persistence/root-registry.ts';
 import { cleanupReleasedManagedMarkers } from '../src/core/persistence/release-markers.ts';
+import { topologyDirectoryIdentity } from '../src/core/persistence/topology-filesystem.ts';
 import { APPLICATION_AUTHORITY, prepareRemoteAgent, prepareRemoteJob, withSubmissionAuthority } from '../src/core/minions/submission-authority.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { __setPackLocatorForTests, _resetPackLocatorForTests } from '../src/core/schema-pack/load-active.ts';
@@ -376,6 +377,14 @@ test('writer release restores only the selected inactive source and preserves la
           expect(await cleanupReleasedManagedMarkers(engine, intent.request_id)).toMatchObject({ state: 'pending' });
           expect(delayedMarkers()).toEqual(held); expect(markerBytes(siblingRoot)).toEqual(protectedSibling);
           expect(readFileSync(siblingRegistry, 'utf8')).toBe(protectedRegistry);
+          expect(await getWorktreeBinding(engine, siblingId)).toEqual(siblingBinding);
+          const retainedIdentity = topologyDirectoryIdentity(root);
+          await makeGitFixture(root);
+          expect(topologyDirectoryIdentity(root)).toEqual(retainedIdentity); expect(existsSync(join(root, '.git'))).toBe(true);
+          expect(await cleanupReleasedManagedMarkers(engine, intent.request_id)).toMatchObject({ state: 'pending' });
+          expect(await admin({ ...intent, expected_state: await writerAdminState(engine) })).toMatchObject({ local_markers: { state: 'pending' } });
+          expect(delayedMarkers()).toEqual(held); expect(readFileSync(gitMarker, 'utf8')).toBe(sharedGitBytes);
+          expect(markerBytes(siblingRoot)).toEqual(protectedSibling); expect(readFileSync(siblingRegistry, 'utf8')).toBe(protectedRegistry);
           expect(await getWorktreeBinding(engine, siblingId)).toEqual(siblingBinding);
         }
         expect(await settings()).toEqual(before.settings);

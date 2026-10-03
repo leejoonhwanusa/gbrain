@@ -510,6 +510,10 @@ brain, source incarnation, worktree, root, owner epoch, topology generation,
 physical directory device/inode/birth identity and private marker digests.
 Cleanup rechecks the physical directory and all current source/host roots,
 including nonoverlapping siblings sharing a Git marker, before each deletion.
+The receipt also fixes the original canonical Git marker path, including an
+explicit null for a non-Git root. Changed Git boundaries refuse release or
+leave delayed cleanup pending; cleanup never substitutes a newly discovered
+Git path for the recorded deletion target.
 Cleanup holds the native topology/worktree locks and
 removes the physical reservation last. Changed identity, marker bytes or a
 later claim leave the markers intact and report `local_markers.state=pending`.

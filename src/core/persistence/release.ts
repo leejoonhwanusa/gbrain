@@ -13,7 +13,7 @@ import { assertNoPhysicalRootOverlap } from './physical-root-record.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
 import { lockTopologyPrincipal, lockTopologyRows, topologyPrincipal, withTopologyLocks } from './topology-locks.ts';
 import { priorTopologyChange, recordTopologyChange } from './topology-receipts.ts';
-import { assertNoReleaseRootSharing, captureReleaseMarkers, cleanupReleasedManagedMarkers } from './release-markers.ts';
+import { assertNoReleaseRootSharing, assertReleaseGitBoundary, captureReleaseMarkers, cleanupReleasedManagedMarkers } from './release-markers.ts';
 import { topologyDirectoryIdentity } from './topology-filesystem.ts';
 import { planHoldCarry } from '../connectors/item-holds-store.ts';
 
@@ -78,12 +78,13 @@ export async function releaseSourceClaim(engine: BrainEngine, sourceId: string,
       await lockTopologyRows(tx, sourceId, bindings);
       await lockTopologyPrincipal(tx, principal);
       const current = await inspect(tx, sourceId);
+      assertReleaseGitBoundary(current.root, markers.git_marker_path);
       const again = await priorTopologyChange(tx, principal, requestId, intent);
       if (again) throw new OperationError('writer_admin_state_changed', 'This release completed concurrently; inspect its receipt.');
       const result = { released: true, brain_id: current.brain_id, source_id: sourceId,
         source_incarnation: current.source_incarnation, worktree_id: current.worktree_id, root: current.root,
         coordination_path: current.coordination_path!, owner_host_id: current.owner_host_id,
-        owner_epoch: String(current.owner_epoch), topology_generation: String(current.topology_generation), marker_digests: markers,
+        owner_epoch: String(current.owner_epoch), topology_generation: String(current.topology_generation), ...markers,
         physical_identity: topologyDirectoryIdentity(current.root) };
       const removed = await tx.executeRaw('DELETE FROM persistence_source_bindings WHERE source_id=$1 AND worktree_id=$2::uuid AND source_incarnation=$3::uuid RETURNING source_id',
         [sourceId, current.worktree_id, current.source_incarnation]);

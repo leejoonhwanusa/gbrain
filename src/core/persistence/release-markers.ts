@@ -1,6 +1,6 @@
 /** Receipt-bound cleanup of one released root; never authorizes epoch-wide removal. */
 import { unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { sha256 } from './digest.ts';
 import { existingLocalHostId } from './identity.ts';
@@ -16,14 +16,23 @@ import { topologyDirectoryIdentity } from './topology-filesystem.ts';
 interface Marker { path: string; digest: string }
 interface Released { brain_id: string; source_id: string; source_incarnation: string; worktree_id: string; root: string;
   coordination_path: string; owner_host_id: string; owner_epoch: string; topology_generation: string; marker_digests: Marker[];
-  physical_identity: ReturnType<typeof topologyDirectoryIdentity> }
+  physical_identity: ReturnType<typeof topologyDirectoryIdentity>; git_marker_path: string | null }
 const hashRecord = (value: unknown) => sha256(JSON.stringify(value));
+
+function releaseGitMarker(root: string): string | null {
+  const path = gitManagedMarker(root);
+  return path ? canonicalFilesystemPath(path) : null;
+}
+export function assertReleaseGitBoundary(root: string, expected: unknown): void {
+  if (expected !== null && (typeof expected !== 'string' || !isAbsolute(expected)) || releaseGitMarker(root) !== expected) {
+    throw new OperationError('source_changed', 'The captured Git ownership boundary changed; its markers were retained.');
+  }
+}
 
 /** Registration and claims both veto cleanup of a shared root or Git marker. */
 export async function assertNoReleaseRootSharing(engine: BrainEngine,
   row: { root: string; source_id: string; source_incarnation: string }, ownWorktree?: string): Promise<void> {
-  const marker = gitManagedMarker(row.root);
-  const git = marker ? canonicalFilesystemPath(marker) : null;
+  const git = releaseGitMarker(row.root);
   const sources = await engine.executeRaw<{ id: string; incarnation: string; local_path: string | null }>('SELECT id,incarnation,local_path FROM sources');
   const hosts = await engine.executeRaw<{ worktree_id: string; local_path: string | null }>('SELECT worktree_id,local_path FROM persistence_host_bindings');
   const paths = [...sources.filter(source => source.id !== row.source_id || source.incarnation !== row.source_incarnation),
@@ -36,8 +45,8 @@ export async function assertNoReleaseRootSharing(engine: BrainEngine,
   }
 }
 
-export function captureReleaseMarkers(binding: WorktreeBinding & { brain_id: string; root: string }): Marker[] {
-  const git = gitManagedMarker(binding.root);
+export function captureReleaseMarkers(binding: WorktreeBinding & { brain_id: string; root: string }): { marker_digests: Marker[]; git_marker_path: string | null } {
+  const git = releaseGitMarker(binding.root);
   // The reservation is last: no new physical claim may start until every other old marker is removed.
   const paths = [...new Set([managedRootRecordPath(binding.brain_id, binding.root), join(binding.root, '.gbrain-managed'),
     ...(git ? [git] : []), join(binding.root, PHYSICAL_ROOT_MARKER), physicalRootReservationPath(binding.root)])];
@@ -55,7 +64,7 @@ export function captureReleaseMarkers(binding: WorktreeBinding & { brain_id: str
     || !markers.some(row => row.path === join(binding.root, PHYSICAL_ROOT_MARKER))) {
     throw new OperationError('recovery_required', 'The physical claim markers are required before release.');
   }
-  return markers;
+  return { marker_digests: markers, git_marker_path: git };
 }
 
 export async function cleanupReleasedManagedMarkers(engine: BrainEngine, requestId?: string, locksHeld = false): Promise<LocalMarkerReport> {
@@ -76,6 +85,7 @@ export async function cleanupReleasedManagedMarkers(engine: BrainEngine, request
         }
       };
       physical();
+      assertReleaseGitBoundary(row.root, row.git_marker_path);
       const [currentBrain] = await engine.executeRaw<{ brain_id: string; enabled: boolean }>('SELECT brain_id,enabled FROM persistence_brain WHERE singleton=1');
       const [owner] = await engine.executeRaw<{ state: string; owner_epoch: string; topology_generation: string }>(
         'SELECT state,owner_epoch::text,topology_generation::text FROM persistence_worktrees WHERE id=$1::uuid', [row.worktree_id]);
@@ -98,6 +108,7 @@ export async function cleanupReleasedManagedMarkers(engine: BrainEngine, request
         if (value === null) continue;
         await assertNoReleaseRootSharing(engine, row);
         physical();
+        assertReleaseGitBoundary(row.root, row.git_marker_path);
         const current = readPrivate(marker.path);
         if (current === null) continue;
         if (hashRecord(current) !== marker.digest) { report.pending.push({ path: marker.path, reason: 'changed_while_cleaning' }); return; }
