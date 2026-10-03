@@ -1,5 +1,7 @@
 # Key files: Core Persistence
 
+- `src/core/persistence/{release,release-markers}.ts` — private local `writer_release` for one exclusive claim while persistence is disabled. Intent/state and existing quiescence guards precede transactional binding removal and worktree retirement. A retained receipt authorizes only exact identity-bound marker cleanup under native locks; its reservation is removed last and later claims are preserved. Sources, pages, files, other bindings, mode epoch and shared-skill settings remain unchanged. Tests: `test/persistence-sync-options.serial.test.ts`. Runbook: [release one inactive claim](../topologies.md#release-one-inactive-claim).
+
 [Subsystem index](../KEY_FILES.md). Read only the entries relevant to your change.
 Current behavior and load-bearing invariants; history belongs in Git and CHANGELOG.
 The page operations that submit through this layer are in [Core Services (2/3)](core-services-2.md).

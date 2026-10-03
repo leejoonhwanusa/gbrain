@@ -485,6 +485,45 @@ parent, persistence home and stable lock/coordination directory together across
 recreation. Storage preflight reports each location and can identify Linux
 overlay/tmpfs backing, but a mount shown as present is **not** attested durable.
 
+### Release one inactive claim
+
+The private local CLI command `sources writer release <source>` removes one
+exclusive claim while persistence is disabled. This addresses a prepared claim
+that fences classic sync before activation. It preserves the source identity,
+canonical files, pages, other claims, mode epoch and shared-skill settings.
+An active managed brain, shared worktrees, Git markers or overlapping roots, a foreign owner, an admin
+lock, pending work, recovery, leases or held connector items refuse release.
+
+Inspect the selected brain and preview the exact source first:
+
+```bash
+gbrain sources writer status --json
+gbrain sources writer release <source> --dry-run --json
+# Apply only the reviewed preview's command, with its fresh admin_state.
+gbrain sources writer release <source> --admin-intent writer_release \
+  --expected-state <reviewed-admin-state> --request-id <uuid> --json
+```
+
+The release transaction retires only the selected worktree and removes its
+source and host bindings. Its retained receipt binds cleanup to the exact
+brain, source incarnation, worktree, root, owner epoch, topology generation,
+physical directory device/inode/birth identity and private marker digests.
+Cleanup rechecks the physical directory and all current source/host roots,
+including nonoverlapping siblings sharing a Git marker, before each deletion.
+Cleanup holds the native topology/worktree locks and
+removes the physical reservation last. Changed identity, marker bytes or a
+later claim leave the markers intact and report `local_markers.state=pending`.
+The receipt identity also protects partial cleanup after its stamp is gone.
+An already absent complete marker set requires no deletion or new-root check.
+Database release and local cleanup are separate outcomes; inspect both.
+`writer status` retries receipt-bound cleanup on this host. The same request UUID
+can be replayed with a freshly reviewed state; different intent conflicts.
+
+Release does not prove that a subsequent sync is safe. Inspect a native sync
+dry run separately, especially when database pages outnumber canonical files.
+Do not force sync or create commits to hide a mismatch. This command does not
+activate shared skills or authorize a brain-wide maintenance cycle.
+
 ### Claim and activate runbook
 
 Activation is reversible through the [deactivate runbook](#deactivate-runbook)

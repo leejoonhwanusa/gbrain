@@ -12,6 +12,9 @@ export interface ManagedRootRecord {
   topology_generation?: string | number;
 }
 function registryDirectory(): string { return join(configDir(), 'persistence', 'managed-roots'); }
+export function managedRootRecordPath(brainId: string, root: string): string {
+  return join(registryDirectory(), `${brainId}.${createHash('sha256').update(canonicalFilesystemPath(root)).digest('hex')}.json`);
+}
 function gitMetadataDirectory(root: string): string | null {
   const git = join(root, '.git');
   if (!existsSync(git)) return null;
@@ -103,8 +106,7 @@ export function recordManagedRoots(brainId: string, records: ManagedRootRecord[]
   let changed = false;
   for (const record of records) {
     const root = canonicalFilesystemPath(record.local_path);
-    const key = createHash('sha256').update(root).digest('hex');
-    const file = join(directory, `${brainId}.${key}.json`);
+    const file = managedRootRecordPath(brainId, root);
     const value = JSON.stringify({ version: 1, brain_id: brainId, root, ...record, local_path: root,
       ...(record.topology_generation != null ? { topology_generation: String(record.topology_generation) } : {}),
       ...(modeEpoch !== undefined ? { mode_epoch: modeEpoch } : {}) });

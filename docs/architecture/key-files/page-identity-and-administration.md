@@ -37,9 +37,18 @@ statement. An encoded ID never falls back to another source. Source aliases
 remain source-bound.
 
 `writer_status` reads an existing host identity without creating one. Claim,
-activate and transfer are explicit local administration paths; ordinary page
+activate, release and transfer are explicit local administration paths; ordinary page
 errors, startup and `doctor --fix` lead with inspection, not ownership changes.
 The CLI uses the shared BigInt replacer when rendering PostgreSQL epochs.
+
+`writer_release` is a private local CLI path for one exclusive claim on an
+inactive brain. It requires action-specific intent and a reviewed admin state,
+retains source identities and content, and records exact marker digests for
+cleanup under native locks. Later claims and changed markers are preserved;
+database release does not imply that local cleanup or sync succeeded. See
+`src/core/persistence/{release,release-markers}.ts`, the
+[release procedure](../topologies.md#release-one-inactive-claim), and
+`test/persistence-sync-options.serial.test.ts`.
 
 Behavioral coverage lives in `test/helpers/deep-research-contract.ts`, its
 PGLite/Postgres callers, `test/e2e/deep-research-http.test.ts` (live OAuth

@@ -29,7 +29,7 @@ function flushDirectory(path: string): void {
   catch (error) { if (!(process.platform === 'win32' && ['EISDIR','EPERM','EINVAL','ENOTSUP'].includes((error as NodeJS.ErrnoException).code ?? ''))) throw error; }
   finally { if (fd !== undefined) closeSync(fd); }
 }
-function readPrivate(path: string): unknown | null {
+export function readPrivate(path: string): unknown | null {
   let fd: number | undefined;
   try {
     if (lstatSync(path).isSymbolicLink()) throw physicalRootError();

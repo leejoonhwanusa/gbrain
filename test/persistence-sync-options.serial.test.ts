@@ -1,9 +1,10 @@
 import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import * as fs from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importFromContent } from '../src/core/import-file.ts';
@@ -19,6 +20,12 @@ import { sha256 } from '../src/core/persistence/digest.ts';
 import { currentSourceFilesystemSignal, withSourceFilesystemLock } from '../src/core/minions/source-filesystem.ts';
 import { managedSyncAuthority, withLegacySyncDelegation } from '../src/core/persistence/sync-authority.ts';
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
+import { runPersistenceAdministration } from '../src/core/persistence/administration.ts';
+import { writerAdminState } from '../src/core/persistence/admin-intent.ts';
+import { cleanupRetiredManagedMarkers } from '../src/core/persistence/deactivation.ts';
+import { PHYSICAL_ROOT_MARKER, physicalRootReservationPath } from '../src/core/persistence/physical-root-record.ts';
+import { managedRootRecordPath, recordManagedRoots, registeredManagedRoots } from '../src/core/persistence/root-registry.ts';
+import { cleanupReleasedManagedMarkers } from '../src/core/persistence/release-markers.ts';
 import { APPLICATION_AUTHORITY, prepareRemoteAgent, prepareRemoteJob, withSubmissionAuthority } from '../src/core/minions/submission-authority.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { __setPackLocatorForTests, _resetPackLocatorForTests } from '../src/core/schema-pack/load-active.ts';
@@ -196,6 +203,194 @@ check('claimed inactive filesystem and connector calls refuse before fetch or pu
     await assertUntouched(engine, f);
   }
 });
+
+test('writer release restores only the selected inactive source and preserves later claims', async () => {
+  const databaseUrl = process.env.DATABASE_URL;
+  for (const postgresUrl of databaseUrl ? [undefined, databaseUrl] : [undefined]) {
+  const releaseHome = mkdtempSync(join(home, 'release-'));
+  await withEnv({ GBRAIN_HOME: releaseHome, GBRAIN_SYNC_FAILURES_DIR: releaseHome, GBRAIN_SOURCE: undefined, DATABASE_URL: undefined, GBRAIN_DATABASE_URL: undefined }, async () => {
+    const fetch = globalThis.fetch;
+    let store: { engine: BrainEngine; close: () => Promise<void> } | undefined;
+    let networkCalls = 0;
+    globalThis.fetch = Object.assign(async () => { networkCalls++; throw new Error('Network calls are forbidden in the release fixture'); }, { preconnect: fetch.preconnect });
+    try {
+      // Qualify the CLI's default module path; the separate instance-pool stall remains unresolved.
+      if (postgresUrl) store = await isolatedPersistencePostgres(postgresUrl, 'module');
+      else {
+        const engine = new PGLiteEngine(); store = { engine, close: () => engine.disconnect() };
+        await engine.connect({}); await engine.initSchema();
+      }
+      const { engine } = store;
+      const a = await fixture(engine, 1, false, releaseHome), b = await fixture(engine, 1, false, releaseHome);
+      const staleState = await writerAdminState(engine);
+      for (const f of [a, b]) {
+        await importFromContent(engine, 'records/example-0', readFileSync(join(f.root, 'records/example-0.md'), 'utf8'),
+          { sourceId: f.id, sourcePath: 'records/example-0.md', noEmbed: true });
+        await claimWorktree(engine, f.id, f.root);
+      }
+      const cli = await registerLocalWriter(engine, 'cli'), stdio = await registerLocalWriter(engine, 'stdio');
+      const admin = (params: Record<string, unknown>) => withVerifiedLocalRegistration(engine, cli,
+        () => runPersistenceAdministration(engine, 'writer_release', params));
+      const reviewed = async () => ({ source_id: a.id, request_id: randomUUID(), admin_intent: 'writer_release', expected_state: await writerAdminState(engine) });
+      const markers = (root: string) => [join(root, PHYSICAL_ROOT_MARKER), physicalRootReservationPath(root), join(root, '.gbrain-managed'), join(root, '.git', 'gbrain-managed.json')];
+      const markerBytes = (root: string) => markers(root).map(path => ({ path, content: existsSync(path) ? readFileSync(path, 'utf8') : null }));
+      const settings = () => engine.executeRaw<{ brain_id: string; enabled: boolean; mode_epoch: string; skill_bundles_enabled: boolean; writer_protocol_floor: number }>('SELECT brain_id,enabled,mode_epoch::text,skill_bundles_enabled,writer_protocol_floor FROM persistence_brain WHERE singleton=1');
+      const sources = () => engine.executeRaw('SELECT id,incarnation,local_path,archived FROM sources ORDER BY id');
+      const snapshot = async () => ({ settings: await settings(), sources: await sources(), config: await engine.executeRaw('SELECT key,value FROM config ORDER BY key'),
+        a: await getWorktreeBinding(engine, a.id), b: await getWorktreeBinding(engine, b.id), markers: [markerBytes(a.root), markerBytes(b.root)],
+        roots: registeredManagedRoots(), pages: await Promise.all([a, b].map(f => engine.getPage('records/example-0', { sourceId: f.id }))),
+        files: [a, b].map(f => readFileSync(join(f.root, 'records/example-0.md'), 'utf8')) });
+      const before = await snapshot();
+      expect(before.settings[0].enabled).toBe(false);
+      expect(before.a).not.toBeNull(); expect(before.b).not.toBeNull();
+      for (const f of [a, b]) expect(existsSync(join(f.root, PHYSICAL_ROOT_MARKER))).toBe(true);
+      expect(await admin({ source_id: a.id, dry_run: true })).toMatchObject({ dry_run: true });
+      expect(await snapshot()).toEqual(before);
+      await expect(performSync(engine, a.opts)).rejects.toMatchObject({ code: 'writer_coordinator_required' });
+      await expect(admin({ source_id: a.id, request_id: randomUUID() })).rejects.toMatchObject({ code: 'writer_admin_intent_required' });
+      const remoteParams = await reviewed();
+      await expect(withVerifiedLocalRegistration(engine, stdio, () => runPersistenceAdministration(engine, 'writer_release', remoteParams)))
+        .rejects.toMatchObject({ code: 'permission_denied' });
+      await expect(admin({ ...await reviewed(), expected_state: staleState })).rejects.toMatchObject({ code: 'writer_admin_state_changed' });
+      expect(await snapshot()).toEqual(before);
+      await withVerifiedLocalRegistration(engine, cli, () => runPersistenceAdministration(engine, 'writer_lock', {}));
+      try { await expect(admin(await reviewed())).rejects.toMatchObject({ code: 'writer_admin_locked' }); }
+      finally { await withVerifiedLocalRegistration(engine, cli, () => runPersistenceAdministration(engine, 'writer_unlock', {})); }
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+      try { await expect(admin(await reviewed())).rejects.toMatchObject({ code: 'writer_release_requires_classic' }); }
+      finally { await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1'); }
+      const apply = await reviewed(), result = await admin(apply);
+      expect(result).toMatchObject({ released: true, source_id: a.id, worktree_id: before.a!.worktree_id,
+        brain_id: before.settings[0].brain_id, owner_epoch: before.a!.owner_epoch, local_markers: { state: 'cleared' } });
+      expect(await getWorktreeBinding(engine, a.id)).toBeNull();
+      expect(await getWorktreeBinding(engine, b.id)).toEqual(before.b);
+      expect(await settings()).toEqual(before.settings); expect(await sources()).toEqual(before.sources);
+      expect(await Promise.all([a, b].map(f => engine.getPage('records/example-0', { sourceId: f.id })))).toEqual(before.pages);
+      expect([a, b].map(f => readFileSync(join(f.root, 'records/example-0.md'), 'utf8'))).toEqual(before.files);
+      for (const path of markers(a.root)) expect(existsSync(path)).toBe(false);
+      expect(markerBytes(b.root)).toEqual(before.markers[1]);
+      expect(registeredManagedRoots()).toEqual(before.roots.filter(root => root !== a.root));
+      const released = await snapshot();
+      expect(await admin({ ...apply, expected_state: await writerAdminState(engine) })).toMatchObject({ released: true,
+        source_id: result.source_id, worktree_id: result.worktree_id, brain_id: result.brain_id, owner_epoch: result.owner_epoch,
+        local_markers: { state: 'cleared' } });
+      expect(await snapshot()).toEqual(released);
+      expect(await performSync(engine, a.opts)).toMatchObject({ status: 'first_sync' });
+      expect((await engine.getPage('records/example-0', { sourceId: a.id }))?.compiled_truth).toBe(before.pages[0]!.compiled_truth);
+      await claimWorktree(engine, a.id, a.root);
+      const reclaimed = await snapshot();
+      expect(reclaimed.a!.worktree_id).not.toBe(before.a!.worktree_id);
+      expect(existsSync(join(a.root, PHYSICAL_ROOT_MARKER))).toBe(true);
+      await cleanupRetiredManagedMarkers(engine);
+      expect(await snapshot()).toEqual(reclaimed);
+      const siblingParent = join(releaseHome, 'shared-git-parent'); mkdirSync(siblingParent);
+      const siblings = ['source-a', 'source-b'].map(name => ({ id: `release-sibling-${name}`, root: join(siblingParent, name) }));
+      for (const sibling of siblings) {
+        mkdirSync(sibling.root); writeFileSync(join(sibling.root, 'example.md'), body);
+        await engine.executeRaw('INSERT INTO sources(id,name,local_path) VALUES($1,$1,$2)', [sibling.id, sibling.root]);
+      }
+      for (const sibling of siblings) await claimWorktree(engine, sibling.id, sibling.root);
+      const siblingBindings = await Promise.all(siblings.map(sibling => getWorktreeBinding(engine, sibling.id)));
+      expect(siblingBindings[0]!.worktree_id).not.toBe(siblingBindings[1]!.worktree_id);
+      expect(siblingBindings.map(binding => binding!.relative_path)).toEqual(['', '']);
+      await makeGitFixture(siblingParent);
+      recordManagedRoots(before.settings[0].brain_id, siblingBindings.map(binding => ({ local_path: binding!.local_path!,
+        source_id: binding!.source_id, source_incarnation: binding!.source_incarnation, worktree_id: binding!.worktree_id,
+        topology_generation: binding!.topology_generation })), Number(before.settings[0].mode_epoch));
+      expect(existsSync(join(siblingParent, '.git', 'gbrain-managed.json'))).toBe(true);
+      const sharedMarkers = markerBytes(siblingParent), siblingBefore = await snapshot();
+      const siblingMarkers = siblings.map(sibling => markerBytes(sibling.root));
+      for (const params of [{ source_id: siblings[0].id, dry_run: true }, { ...await reviewed(), source_id: siblings[0].id }]) {
+        await expect(admin(params)).rejects.toMatchObject({ code: 'source_changed', message: 'Another registered source shares this Git ownership marker.' });
+        expect(await snapshot()).toEqual(siblingBefore);
+        expect(await Promise.all(siblings.map(sibling => getWorktreeBinding(engine, sibling.id)))).toEqual(siblingBindings);
+        expect(siblings.map(sibling => markerBytes(sibling.root))).toEqual(siblingMarkers);
+        expect(markerBytes(siblingParent)).toEqual(sharedMarkers);
+      }
+      const protectedPages = await Promise.all([a, b].map(f => engine.getPage('records/example-0', { sourceId: f.id })));
+      for (const scenario of ['physical', 'sharing'] as const) {
+        const parent = mkdtempSync(join(releaseHome, 'delayed-release-')), root = join(parent, 'released'); mkdirSync(root);
+        const sourceId = `release-delayed-${randomUUID().slice(0, 8)}`;
+        writeFileSync(join(root, 'example.md'), body);
+        await engine.executeRaw('INSERT INTO sources(id,name,local_path) VALUES($1,$1,$2)', [sourceId, root]);
+        const binding = await claimWorktree(engine, sourceId, root), gitRoot = scenario === 'physical' ? root : parent;
+        await makeGitFixture(gitRoot);
+        recordManagedRoots(before.settings[0].brain_id, [{ local_path: binding.local_path!, source_id: sourceId,
+          source_incarnation: binding.source_incarnation, worktree_id: binding.worktree_id,
+          topology_generation: binding.topology_generation }], Number(before.settings[0].mode_epoch));
+        const registry = managedRootRecordPath(before.settings[0].brain_id, root), gitMarker = join(gitRoot, '.git', 'gbrain-managed.json');
+        const paths = [...new Set([registry, ...markers(root), gitMarker])];
+        const delayedMarkers = () => paths.map(path => ({ path, content: existsSync(path) ? readFileSync(path, 'utf8') : null }));
+        const intent = { ...await reviewed(), source_id: sourceId }, originalUnlink = fs.unlinkSync;
+        let injected = 0, pendingResult: Record<string, unknown> | undefined;
+        const deletion = spyOn(fs, 'unlinkSync').mockImplementation(path => {
+          if (String(path) === registry && !injected) { injected++; throw new Error('Synthetic first marker deletion failure'); }
+          return originalUnlink(path);
+        });
+        try { pendingResult = await admin(intent); } finally { deletion.mockRestore(); }
+        expect(injected).toBe(1);
+        expect(pendingResult).toMatchObject({ released: true, source_id: sourceId, worktree_id: binding.worktree_id,
+          physical_identity: { device: expect.any(String), inode: expect.any(String), birthNs: expect.any(String) }, local_markers: { state: 'pending' } });
+        expect(await getWorktreeBinding(engine, sourceId)).toBeNull();
+        const held = delayedMarkers();
+        if (scenario === 'physical') {
+          const original = join(parent, 'original'), copied = join(parent, 'copied');
+          for (const path of [root, original, copied]) expect(path.startsWith(`${releaseHome}${sep}`)).toBe(true);
+          renameSync(root, original); cpSync(original, root, { recursive: true });
+          try {
+            expect(await cleanupReleasedManagedMarkers(engine, intent.request_id)).toMatchObject({ state: 'pending' });
+            expect(delayedMarkers()).toEqual(held);
+            fs.unlinkSync(join(root, PHYSICAL_ROOT_MARKER));
+            const partialCopy = delayedMarkers();
+            expect(await cleanupReleasedManagedMarkers(engine, intent.request_id)).toMatchObject({ state: 'pending' });
+            expect(delayedMarkers()).toEqual(partialCopy);
+            expect(existsSync(physicalRootReservationPath(root))).toBe(true);
+          } finally { renameSync(root, copied); renameSync(original, root); }
+          fs.unlinkSync(join(root, PHYSICAL_ROOT_MARKER));
+          expect(existsSync(physicalRootReservationPath(root))).toBe(true);
+          expect(await admin({ ...intent, expected_state: await writerAdminState(engine) })).toMatchObject({ local_markers: { state: 'cleared' } });
+          for (const path of paths) expect(existsSync(path)).toBe(false);
+          renameSync(root, original); mkdirSync(root); writeFileSync(join(root, 'keep.md'), 'Replacement fixture content.');
+          expect(await admin({ ...intent, expected_state: await writerAdminState(engine) })).toMatchObject({ local_markers: { state: 'cleared' } });
+          expect(readFileSync(join(root, 'keep.md'), 'utf8')).toBe('Replacement fixture content.');
+        } else {
+          const siblingRoot = join(parent, 'sibling'), heldGit = join(parent, 'held-git'), siblingId = `release-protected-${randomUUID().slice(0, 8)}`;
+          for (const path of [root, siblingRoot, heldGit, join(parent, '.git')]) expect(path.startsWith(`${releaseHome}${sep}`)).toBe(true);
+          mkdirSync(siblingRoot); writeFileSync(join(siblingRoot, 'example.md'), body);
+          await engine.executeRaw('INSERT INTO sources(id,name,local_path) VALUES($1,$1,$2)', [siblingId, siblingRoot]);
+          expect(await getWorktreeBinding(engine, siblingId)).toBeNull();
+          expect(await cleanupReleasedManagedMarkers(engine, intent.request_id)).toMatchObject({ state: 'pending' });
+          expect(delayedMarkers()).toEqual(held);
+          const sharedGitBytes = readFileSync(gitMarker, 'utf8');
+          renameSync(join(parent, '.git'), heldGit);
+          try { await claimWorktree(engine, siblingId, siblingRoot); }
+          finally { renameSync(heldGit, join(parent, '.git')); }
+          const siblingBinding = (await getWorktreeBinding(engine, siblingId))!;
+          expect(siblingBinding.worktree_id).not.toBe(binding.worktree_id); expect(siblingBinding.relative_path).toBe('');
+          recordManagedRoots(before.settings[0].brain_id, [{ local_path: siblingBinding.local_path!, source_id: siblingId,
+            source_incarnation: siblingBinding.source_incarnation, worktree_id: siblingBinding.worktree_id,
+            topology_generation: siblingBinding.topology_generation }], Number(before.settings[0].mode_epoch));
+          expect(readFileSync(gitMarker, 'utf8')).toBe(sharedGitBytes);
+          const protectedSibling = markerBytes(siblingRoot), siblingRegistry = managedRootRecordPath(before.settings[0].brain_id, siblingRoot);
+          const protectedRegistry = readFileSync(siblingRegistry, 'utf8');
+          expect(await cleanupReleasedManagedMarkers(engine, intent.request_id)).toMatchObject({ state: 'pending' });
+          expect(delayedMarkers()).toEqual(held); expect(markerBytes(siblingRoot)).toEqual(protectedSibling);
+          expect(readFileSync(siblingRegistry, 'utf8')).toBe(protectedRegistry);
+          expect(await getWorktreeBinding(engine, siblingId)).toEqual(siblingBinding);
+        }
+        expect(await settings()).toEqual(before.settings);
+        expect(await getWorktreeBinding(engine, a.id)).toEqual(reclaimed.a); expect(await getWorktreeBinding(engine, b.id)).toEqual(before.b);
+        expect(markerBytes(b.root)).toEqual(before.markers[1]);
+        expect(await Promise.all([a, b].map(f => engine.getPage('records/example-0', { sourceId: f.id })))).toEqual(protectedPages);
+      }
+      expect(networkCalls).toBe(0);
+    } finally {
+      try { if (store) { try { await disposePersistenceConsumer(store.engine); } finally { await store.close(); } } }
+      finally { globalThis.fetch = fetch; rmSync(releaseHome, { recursive: true, force: true }); }
+    }
+  });
+  }
+}, 120_000);
 
 check('inherited cancellation and a released filesystem context never enter the new routing path', async engine => {
   const f = await fixture(engine, 1, false);

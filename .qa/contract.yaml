@@ -1,0 +1,103 @@
+schema_version: 1
+project_id: gbrain-windows
+risk_class: high
+layers:
+  regression: {enabled: true, runner: process, timeout_seconds: 1200}
+safety:
+  default_mode: read_only
+  external_network: deny_unless_declared
+  commerce_mutation: deny
+  database_mutation: deny
+  trade_mutation: deny
+evidence:
+  source_commit: required
+  artifact_digest: required
+  required_kinds_by_driver:
+    process: [stderr]
+    manual: [manual_log]
+approved_profiles:
+  source_release_serial:
+    description: Existing isolated claimed-source sync and source-release regression; no live brain
+    interpreter: C:/Users/HANILSERVER/.bun/bin/bun.exe
+    command_argv: [test, test/persistence-sync-options.serial.test.ts, --timeout, '120000']
+    working_directory: .
+    timeout_seconds: 600
+    execution_authority: read_only
+    driver: process
+  source_release_admin:
+    description: Existing administration, deactivation, state-bound intent and admin lock regression
+    interpreter: C:/Users/HANILSERVER/.bun/bin/bun.exe
+    command_argv: [test, test/persistence-deactivate.test.ts, test/persistence-admin-intent.test.ts, test/persistence-writer-admin-lock.test.ts, test/persistence-administration.test.ts, --timeout, '120000']
+    working_directory: .
+    timeout_seconds: 600
+    execution_authority: read_only
+    driver: process
+  source_release_verify:
+    description: Existing mandatory source guards, typecheck and module-size verification
+    interpreter: C:/Users/HANILSERVER/.bun/bin/bun.exe
+    command_argv: [run, verify]
+    working_directory: .
+    timeout_seconds: 600
+    execution_authority: read_only
+    driver: process
+  source_release_admin_linux:
+    description: Same existing four authority suites on Linux; Windows IPC fixture failures remain separate evidence
+    interpreter: C:/Windows/System32/wsl.exe
+    command_argv:
+      - --distribution
+      - Ubuntu-24.04
+      - --cd
+      - /mnt/c/Users/HANILSERVER/.codex/worktrees/gbrain-writer-release-06032/gbrain
+      - --exec
+      - /usr/bin/env
+      - -i
+      - HOME=/home/hanilserver
+      - USER=hanilserver
+      - LOGNAME=hanilserver
+      - PATH=/mnt/c/Users/HANILSERVER/.codex/worktrees/gbrain-writer-release-06032/gbrain/node_modules/.cache/bun-toolchain:/usr/local/bin:/usr/bin:/bin
+      - GBRAIN_HOME=/tmp/gbrain-a18-admin-home
+      - LANG=C.UTF-8
+      - TZ=UTC
+      - /mnt/c/Users/HANILSERVER/.codex/worktrees/gbrain-writer-release-06032/gbrain/node_modules/.cache/bun-toolchain/bun
+      - test
+      - test/persistence-deactivate.test.ts
+      - test/persistence-admin-intent.test.ts
+      - test/persistence-writer-admin-lock.test.ts
+      - test/persistence-administration.test.ts
+      - --timeout
+      - '120000'
+    working_directory: .
+    timeout_seconds: 600
+    execution_authority: read_only
+    driver: process
+  source_release_verify_linux:
+    description: Entire existing mandatory verify battery on Linux against the same Windows source tree
+    interpreter: C:/Windows/System32/wsl.exe
+    command_argv:
+      - --distribution
+      - Ubuntu-24.04
+      - --cd
+      - /mnt/c/Users/HANILSERVER/.codex/worktrees/gbrain-writer-release-06032/gbrain
+      - --exec
+      - /usr/bin/env
+      - -i
+      - HOME=/home/hanilserver
+      - USER=hanilserver
+      - LOGNAME=hanilserver
+      - PATH=/mnt/c/Users/HANILSERVER/.codex/worktrees/gbrain-writer-release-06032/gbrain/node_modules/.cache/bun-toolchain:/usr/local/bin:/usr/bin:/bin
+      - GIT_DIR=/mnt/c/Project/gbrain/.git/worktrees/gbrain
+      - GIT_WORK_TREE=/mnt/c/Users/HANILSERVER/.codex/worktrees/gbrain-writer-release-06032/gbrain
+      - GBRAIN_HOME=/tmp/gbrain-a18-verify-home
+      - GBRAIN_VERIFY_MAX_PARALLEL=2
+      - GBRAIN_VERIFY_TIMEOUT=300
+      - LANG=C.UTF-8
+      - TZ=UTC
+      - /mnt/c/Users/HANILSERVER/.codex/worktrees/gbrain-writer-release-06032/gbrain/node_modules/.cache/bun-toolchain/bun
+      - run
+      - verify
+    working_directory: .
+    timeout_seconds: 1200
+    execution_authority: read_only
+    driver: process
+metadata:
+  verification_scope: Source-release administration and existing regression only; no live owner change or release implied.

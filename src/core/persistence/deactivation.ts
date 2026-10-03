@@ -268,6 +268,11 @@ export async function cleanupRetiredManagedMarkers(engine: BrainEngine): Promise
   const [brain] = await engine.executeRaw<{ brain_id: string; enabled: boolean; mode_epoch: string | null }>(
     "SELECT brain_id, enabled, to_jsonb(persistence_brain)->>'mode_epoch' AS mode_epoch FROM persistence_brain WHERE singleton=1");
   if (!brain) return report;
+  const released = await (await import('./release-markers.ts')).cleanupReleasedManagedMarkers(engine);
+  report.removed.push(...released.removed);
+  report.pending.push(...released.pending);
+  report.state = released.state;
+  if (released.rerun) report.rerun = released.rerun;
   const current = Number(brain.mode_epoch ?? 1);
   const retired = await readRetired(engine, brain.brain_id);
   if (!retired.epochs.size && !retired.worktrees.size) return report;
@@ -335,7 +340,7 @@ export async function cleanupRetiredManagedMarkers(engine: BrainEngine): Promise
   return report;
 }
 
-function gitManagedMarker(root: string): string | null {
+export function gitManagedMarker(root: string): string | null {
   for (let current = root; ; current = dirname(current)) {
     const git = join(current, '.git');
     if (existsSync(git)) {
