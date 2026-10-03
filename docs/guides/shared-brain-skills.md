@@ -359,6 +359,15 @@ downloaded files, other history, or backups.
 ## Migrate an existing brain
 
 Use the mechanical [v0.53.0.0 migration checklist](../../skills/migrations/v0.53.0.0.md).
+
+In `skillpack-check` or `gbrain apply-migrations --list`, `0.53.0` identifies
+this shared-skills migration, not the installed CLI version, which is shown
+separately. A `partial` result means host or client migration work remains;
+it does not mean the binary was downgraded. Retain `completed.jsonl` and
+migration checkpoints: deleting them can make completed migrations appear
+pending again. Do not delete these records or mark unfinished work complete
+merely to hide a warning; use the checklist above to inspect remaining stages.
+
 Start on the host with `gbrain apply-migrations --dry-run --json`. It inventories
 registered roots and reports stage-specific conflicts, not arbitrary home
 directories or disconnected devices. Keep operational DB and content backups
