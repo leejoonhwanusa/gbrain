@@ -17,7 +17,9 @@ import { assertNoReleaseRootSharing, assertReleaseGitBoundary, captureReleaseMar
 import { topologyDirectoryIdentity } from './topology-filesystem.ts';
 import { planHoldCarry } from '../connectors/item-holds-store.ts';
 
-async function inspect(engine: BrainEngine, sourceId: string): Promise<WorktreeBinding & { brain_id: string; root: string }> {
+async function inspect(engine: BrainEngine, sourceId: string): Promise<WorktreeBinding & {
+  brain_id: string; root: string; physical_identity: ReturnType<typeof topologyDirectoryIdentity>;
+}> {
   await assertWriterAdminUnlocked(engine);
   const [brain] = await engine.executeRaw<{ brain_id: string; enabled: boolean }>('SELECT brain_id,enabled FROM persistence_brain WHERE singleton=1');
   if (!brain || brain.enabled) throw new OperationError('writer_release_requires_classic', 'Release is available only while managed persistence is disabled.');
@@ -38,13 +40,14 @@ async function inspect(engine: BrainEngine, sourceId: string): Promise<WorktreeB
     || canonicalFilesystemPath(selected.local_path) !== root) throw new OperationError('source_changed', 'The canonical source identity or path changed.');
   await assertNoReleaseRootSharing(engine, { root, source_id: sourceId, source_incarnation: binding.source_incarnation }, binding.worktree_id);
   assertPhysicalRoot(root, { worktreeId: binding.worktree_id, coordinationPath: binding.coordination_path });
+  const physicalIdentity = topologyDirectoryIdentity(root);
   assertNoPhysicalRootOverlap(root);
   const blockers = await deactivationBlockers(engine);
   const holds = (await planHoldCarry(engine, existingLocalHostId())).filter(row => row.items > 0);
   if (blockers.length || holds.length) throw new OperationError('writer_not_quiesced', 'Pending requests, effects, recovery, leases or connector holds prevent release.',
     [...blockers.map(row => `${row.kind} ${row.id}: ${row.exit}`),
       ...holds.map(row => `connector_holds ${row.source_id}: inspect gbrain sources status ${row.source_id}`)].slice(0, 10).join(' | '));
-  return { ...binding, brain_id: brain.brain_id, root };
+  return { ...binding, brain_id: brain.brain_id, root, physical_identity: physicalIdentity };
 }
 
 export async function releaseSourceClaim(engine: BrainEngine, sourceId: string,
@@ -78,14 +81,23 @@ export async function releaseSourceClaim(engine: BrainEngine, sourceId: string,
       await lockTopologyRows(tx, sourceId, bindings);
       await lockTopologyPrincipal(tx, principal);
       const current = await inspect(tx, sourceId);
-      assertReleaseGitBoundary(current.root, markers.git_marker_path);
       const again = await priorTopologyChange(tx, principal, requestId, intent);
       if (again) throw new OperationError('writer_admin_state_changed', 'This release completed concurrently; inspect its receipt.');
+      // Recheck after the last DB wait; never adopt a replacement root as receipt authority.
+      assertPhysicalRoot(current.root, { worktreeId: current.worktree_id, coordinationPath: current.coordination_path });
+      const actualIdentity = topologyDirectoryIdentity(current.root), expectedIdentity = before.physical_identity;
+      for (const identity of [current.physical_identity, actualIdentity]) {
+        if (identity.device !== expectedIdentity.device || identity.inode !== expectedIdentity.inode || identity.birthNs !== expectedIdentity.birthNs) {
+          throw new OperationError('recovery_required', 'The physical checkout changed during release; its claim and markers were retained.');
+        }
+      }
+      assertNoPhysicalRootOverlap(current.root);
+      assertReleaseGitBoundary(current.root, markers.git_marker_path);
       const result = { released: true, brain_id: current.brain_id, source_id: sourceId,
         source_incarnation: current.source_incarnation, worktree_id: current.worktree_id, root: current.root,
         coordination_path: current.coordination_path!, owner_host_id: current.owner_host_id,
         owner_epoch: String(current.owner_epoch), topology_generation: String(current.topology_generation), ...markers,
-        physical_identity: topologyDirectoryIdentity(current.root) };
+        physical_identity: expectedIdentity };
       const removed = await tx.executeRaw('DELETE FROM persistence_source_bindings WHERE source_id=$1 AND worktree_id=$2::uuid AND source_incarnation=$3::uuid RETURNING source_id',
         [sourceId, current.worktree_id, current.source_incarnation]);
       if (removed.length !== 1) throw new OperationError('source_changed', 'The selected binding changed.');

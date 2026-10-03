@@ -508,6 +508,11 @@ The release transaction retires only the selected worktree and removes its
 source and host bindings. Its retained receipt binds cleanup to the exact
 brain, source incarnation, worktree, root, owner epoch, topology generation,
 physical directory device/inode/birth identity and private marker digests.
+Release freezes the stamp-verified directory identity under the native lock.
+After the last asynchronous receipt lookup and immediately before removing
+bindings, it rechecks the stamp, reservation, frozen identity, root overlap and
+Git boundary. It never adopts a replacement directory's identity as the
+receipt's authority. A later external replacement leaves cleanup pending.
 Cleanup rechecks the physical directory and all current source/host roots,
 including nonoverlapping siblings sharing a Git marker, before each deletion.
 The receipt also fixes the original canonical Git marker path, including an

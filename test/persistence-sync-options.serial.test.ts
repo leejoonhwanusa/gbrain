@@ -392,6 +392,42 @@ test('writer release restores only the selected inactive source and preserves la
         expect(markerBytes(b.root)).toEqual(before.markers[1]);
         expect(await Promise.all([a, b].map(f => engine.getPage('records/example-0', { sourceId: f.id })))).toEqual(protectedPages);
       }
+      for (const boundary of ['inspect', 'receipt'] as const) {
+        const parent = mkdtempSync(join(releaseHome, 'release-race-')), f = await fixture(engine, 1, false, parent);
+        const binding = await claimWorktree(engine, f.id, f.root), identity = topologyDirectoryIdentity(f.root);
+        const original = join(parent, 'original'), replacement = join(parent, 'replacement'), heldMarkers = markerBytes(f.root);
+        for (const path of [f.root, original, replacement]) expect(path.startsWith(`${releaseHome}${sep}`)).toBe(true);
+        const worktree = () => engine.executeRaw('SELECT state,owner_epoch::text,topology_generation::text FROM persistence_worktrees WHERE id=$1::uuid', [binding.worktree_id]);
+        const beforeWorktree = await worktree(), intent = { ...await reviewed(), source_id: f.id };
+        let injected = false;
+        const raced = new Proxy(engine, { get(target, property) {
+          if (property === 'transaction') return (run: (tx: BrainEngine) => Promise<unknown>) => target.transaction(tx => run(new Proxy(tx, { get(transaction, key) {
+            if (key === 'executeRaw') return async (sql: string, params?: unknown[], opts?: { signal?: AbortSignal }) => {
+              const rows = await transaction.executeRaw(sql, params, opts);
+              const atBoundary = boundary === 'inspect'
+                ? sql.includes('FROM persistence_requests') && sql.includes('LIMIT 50')
+                : sql.includes('SELECT * FROM persistence_topology_changes') && params?.includes(intent.request_id);
+              if (!injected && atBoundary) {
+                injected = true; renameSync(f.root, original); cpSync(original, f.root, { recursive: true });
+              }
+              return rows;
+            };
+            const value = Reflect.get(transaction, key); return typeof value === 'function' ? value.bind(transaction) : value;
+          } })));
+          const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+        } });
+        try {
+          await expect(withVerifiedLocalRegistration(raced, cli, () => runPersistenceAdministration(raced, 'writer_release', intent)))
+            .rejects.toMatchObject({ code: 'recovery_required' });
+          expect(injected).toBe(true); expect(topologyDirectoryIdentity(f.root)).not.toEqual(identity);
+          expect(await getWorktreeBinding(engine, f.id)).toEqual(binding); expect(await worktree()).toEqual(beforeWorktree);
+          expect(await engine.executeRaw('SELECT id FROM persistence_topology_changes WHERE request_id=$1::uuid', [intent.request_id])).toEqual([]);
+          expect(markerBytes(f.root)).toEqual(heldMarkers);
+          expect(readFileSync(join(f.root, 'records/example-0.md'), 'utf8')).toBe(body.replace('synthetic record', 'synthetic record 0'));
+        } finally {
+          if (injected) { if (existsSync(f.root)) renameSync(f.root, replacement); renameSync(original, f.root); }
+        }
+      }
       expect(networkCalls).toBe(0);
     } finally {
       try { if (store) { try { await disposePersistenceConsumer(store.engine); } finally { await store.close(); } } }
