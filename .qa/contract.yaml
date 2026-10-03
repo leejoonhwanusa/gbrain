@@ -88,7 +88,7 @@ approved_profiles:
       - GIT_DIR=/mnt/c/Project/gbrain/.git/worktrees/gbrain
       - GIT_WORK_TREE=/mnt/c/Users/HANILSERVER/.codex/worktrees/gbrain-writer-release-06032/gbrain
       - GBRAIN_HOME=/tmp/gbrain-a18-verify-home
-      - GBRAIN_VERIFY_MAX_PARALLEL=2
+      - GBRAIN_VERIFY_MAX_PARALLEL=1
       - GBRAIN_VERIFY_TIMEOUT=300
       - LANG=C.UTF-8
       - TZ=UTC
