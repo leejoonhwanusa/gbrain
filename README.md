@@ -1,5 +1,13 @@
 # GBrain
 
+## Deployment retirement
+
+This deployment retired GBrain and GStack on **2026-10-05**. Shared long-term memory uses Hindsight. Source, stored data, backups and QA history are retained.
+
+Installation, startup, migration, repair, MCP exposure and release instructions below are historical reference for this deployment. Agents must not execute them or re-enable the retired services without a new explicit user instruction.
+
+The default branch's GitHub workflows have no direct schedule, push or pull-request triggers. Retained manual and reusable workflows require explicit authorization to run.
+
 **Give the agent you already use a memory you control.** GBrain stores explicit facts with their sources, supports corrections and withdrawal, and makes the same memory available across your agents. Start with keyless memory and keyword retrieval; add semantic search, synthesis, and background enrichment when you need them.
 
 ## Choose your setup

@@ -1,5 +1,7 @@
 # Agents working on GBrain
 
+> **Retired deployment — 2026-10-05.** Use the shared Hindsight memory workflow. The GBrain/GStack installation and operating protocol below is historical reference, not authorization to install, start, migrate, repair, expose or re-enable these services. A new explicit user instruction is required. See [deployment retirement](README.md#deployment-retirement).
+
 This is your install + operating protocol. Claude Code reads `./CLAUDE.md` automatically.
 Everyone else (Codex, Cursor, OpenClaw, Aider, Continue, or an LLM fetching via URL):
 start here.

@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+> **Retired deployment — 2026-10-05.** Use the shared Hindsight memory workflow. The GBrain/GStack installation and operating protocol below is historical reference, not authorization to install, start, migrate, repair, expose or re-enable these services. A new explicit user instruction is required. See [deployment retirement](README.md#deployment-retirement).
+
 GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable
 engines: PGLite (embedded Postgres via WASM, zero-config default) or Postgres + pgvector
 + hybrid search in a managed Supabase instance. `gbrain init` defaults to PGLite;
